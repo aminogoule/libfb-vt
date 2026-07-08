@@ -149,7 +149,7 @@ SVGA, возвращайте экран текстовой консоли при
 ---
 ---
 
-# English (original)
+# English
 
 # libfb-vt
 
