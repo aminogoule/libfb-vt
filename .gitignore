@@ -1,0 +1,52 @@
+# Build outputs (per-backend binaries: .fb / .vga / .svga suffixes)
+ppm2fb.fb
+ppm2fb.vga
+ppm2fb.svga
+fbshow.fb
+fbshow.vga
+fbshow.svga
+server.fb
+server.vga
+server.svga
+cube.fb
+cube.vga
+cube.svga
+
+# Object files
+*.o
+*.obj
+*.lo
+*.slo
+*.ko
+
+# Static/shared libraries
+*.a
+*.la
+*.lai
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Debug symbols
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Dependency files
+*.d
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Editor / OS cruft
+*~
+*.swp
+.DS_Store
