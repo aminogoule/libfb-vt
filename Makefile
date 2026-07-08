@@ -26,19 +26,28 @@
 CC?=		cc
 CFLAGS?=	-Wall -Wextra -O2
 LIBM?=		-lm
+LIBUTIL?=	-lutil
 
 PROG_SRC_PPM2FB=	ppm2fb.c ppm.c
 PROG_SRC_FBSHOW=	fbshow.c ppm.c
-PROG_SRC_SERVER=	server.c vtcon.c ppm.c
+PROG_SRC_SERVER=	server.c vtcon.c proto.c
 PROG_SRC_CUBE=		cube.c vtcon.c
+PROG_SRC_TERM=		term.c proto.c
 
-HDRS=		fb.h ppm.h vtcon.h fbsvga.h
+HDRS=		fb.h ppm.h vtcon.h fbsvga.h proto.h font8x8.h
 
-all: svga vga fb
+# term is a display-server *client*: it links no framebuffer backend (it only
+# talks the socket protocol + drives a pty), so it is one backend-independent
+# binary, built alongside every backend group.
+all: svga vga fb term
 
 svga: ppm2fb.svga fbshow.svga server.svga cube.svga
 vga:  ppm2fb.vga  fbshow.vga  server.vga  cube.vga
 fb:   ppm2fb.fb   fbshow.fb    server.fb   cube.fb
+
+# ---- terminal client (backend-independent) --------------------------
+term: $(PROG_SRC_TERM) proto.h font8x8.h
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_TERM) $(LIBUTIL)
 
 # ---- VMware SVGA II (linear + HW 2D) --------------------------------
 ppm2fb.svga: $(PROG_SRC_PPM2FB) fb_svga.c $(HDRS)
@@ -75,6 +84,7 @@ clean:
 	      fbshow.fb fbshow.vga fbshow.svga \
 	      server.fb server.vga server.svga \
 	      cube.fb   cube.vga   cube.svga \
+	      term \
 	      *.o
 
 .PHONY: all svga vga fb clean
