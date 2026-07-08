@@ -71,6 +71,10 @@ cube.fb: $(PROG_SRC_CUBE) fb.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb.c $(LIBM)
 
 clean:
-	rm -f ppm2fb.* fbshow.* server.* cube.* *.o
+	rm -f ppm2fb.fb ppm2fb.vga ppm2fb.svga \
+	      fbshow.fb fbshow.vga fbshow.svga \
+	      server.fb server.vga server.svga \
+	      cube.fb   cube.vga   cube.svga \
+	      *.o
 
 .PHONY: all svga vga fb clean
