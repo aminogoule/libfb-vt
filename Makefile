@@ -1,0 +1,76 @@
+# libfb-vt -- console framebuffer graphics + display-server seed for FreeBSD 10+
+#
+# Three interchangeable framebuffer BACKENDS, same fb.h API:
+#
+#   fb.c       -- linear vt(4) framebuffer (vt_fb / scfb / KMS): FBIOGTYPE+mmap
+#                 off the tty. No /dev/mem, no ports. Use on a vtfb0 console.
+#   fb_vga.c   -- planar VGA (vt_vga / vtvga0): mode 0x12 640x480x16 via
+#                 /dev/mem (0xA0000) + /dev/io (VGA ports). Slow fallback.
+#   fb_svga.c  -- VMware SVGA II (PCI 15ad:0405): linear framebuffer + HW 2D
+#                 via /dev/pci + /dev/io + /dev/mem (VRAM & FIFO BARs). No X,
+#                 no DRM/KMS, no vmwgfx. (fbsvga.h adds modeset/enable/2D.)
+#
+# Programs (built once per backend, suffixed .fb / .vga / .svga):
+#   ppm2fb  -- one-shot: draw an image once
+#   fbshow  -- persistent viewer (grabs a free VT)
+#   server  -- display-server seed (exclusive VT ownership, render loop)
+#
+# Binaries are compiled straight from source per variant so the three backends'
+# identical fb_open()/... symbols never collide at link time.
+#
+# Build everything:      make            (== make all)
+# Build one backend:     make svga | make vga | make fb
+# Requirements: run as root on a vt(4) console (sysctl kern.vty == vt).
+#   fb_vga / fb_svga additionally need kern.securelevel <= 0 (writable /dev/mem).
+
+CC?=		cc
+CFLAGS?=	-Wall -Wextra -O2
+LIBM?=		-lm
+
+PROG_SRC_PPM2FB=	ppm2fb.c ppm.c
+PROG_SRC_FBSHOW=	fbshow.c ppm.c
+PROG_SRC_SERVER=	server.c vtcon.c ppm.c
+PROG_SRC_CUBE=		cube.c vtcon.c
+
+HDRS=		fb.h ppm.h vtcon.h fbsvga.h
+
+all: svga vga fb
+
+svga: ppm2fb.svga fbshow.svga server.svga cube.svga
+vga:  ppm2fb.vga  fbshow.vga  server.vga  cube.vga
+fb:   ppm2fb.fb   fbshow.fb    server.fb   cube.fb
+
+# ---- VMware SVGA II (linear + HW 2D) --------------------------------
+ppm2fb.svga: $(PROG_SRC_PPM2FB) fb_svga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_PPM2FB) fb_svga.c
+fbshow.svga: $(PROG_SRC_FBSHOW) fb_svga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_FBSHOW) fb_svga.c
+server.svga: $(PROG_SRC_SERVER) fb_svga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_SERVER) fb_svga.c
+cube.svga: $(PROG_SRC_CUBE) fb_svga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb_svga.c $(LIBM)
+
+# ---- planar VGA (vtvga0) --------------------------------------------
+ppm2fb.vga: $(PROG_SRC_PPM2FB) fb_vga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_PPM2FB) fb_vga.c
+fbshow.vga: $(PROG_SRC_FBSHOW) fb_vga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_FBSHOW) fb_vga.c
+server.vga: $(PROG_SRC_SERVER) fb_vga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_SERVER) fb_vga.c
+cube.vga: $(PROG_SRC_CUBE) fb_vga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb_vga.c $(LIBM)
+
+# ---- linear vt_fb / scfb / KMS (original) ---------------------------
+ppm2fb.fb: $(PROG_SRC_PPM2FB) fb.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_PPM2FB) fb.c
+fbshow.fb: $(PROG_SRC_FBSHOW) fb.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_FBSHOW) fb.c
+server.fb: $(PROG_SRC_SERVER) fb.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_SERVER) fb.c
+cube.fb: $(PROG_SRC_CUBE) fb.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb.c $(LIBM)
+
+clean:
+	rm -f ppm2fb.* fbshow.* server.* cube.* *.o
+
+.PHONY: all svga vga fb clean
