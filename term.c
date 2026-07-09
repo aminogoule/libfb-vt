@@ -2,7 +2,7 @@
  * term -- a graphical terminal emulator, as a client of the libfb-vt
  * compositor (server.c). No VT/framebuffer of its own: it talks the proto.h
  * protocol over the AF_UNIX socket, gets a shared-memory pixel buffer for its
- * window, and renders a text grid into it with the embedded 8x8 font.
+ * window, and renders a text grid into it with the embedded 8x16 font.
  *
  *   compositor <--socket--> term
  *      owns VT              forks a shell in a pty (openpty/forkpty, -lutil)
@@ -15,12 +15,12 @@
  * cursor show/hide, and OSC 0/2 window titles. Enough to run an interactive
  * shell; not a full xterm.
  *
- * Usage: term [rows] [cols]      (defaults 24x80, clamped to the granted size)
+ * Usage: term [rows] [cols]      (defaults 25x80, clamped to the granted size)
  * Run wherever it can reach FBVT_SOCK_PATH (root, same host as the server).
  */
 
 #include "proto.h"
-#include "font8x8.h"
+#include "font8x16.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -41,8 +41,8 @@
 #include <sysexits.h>
 
 #define GLYPH_W 8
-#define GLYPH_H 8
-#define DEF_ROWS 24
+#define GLYPH_H 16
+#define DEF_ROWS 25
 #define DEF_COLS 80
 #define MAX_PARAMS 16
 
@@ -337,7 +337,7 @@ static void render(term_t* t) {
 			int      cur = t->cursor_vis && row == t->cy && col == t->cx;
 			uint32_t fg  = cur ? c->bg : c->fg;
 			uint32_t bg  = cur ? c->fg : c->bg;
-			const unsigned char* g = font8x8_basic[c->ch & 0x7F];
+			const unsigned char* g = font8x16_basic[c->ch];
 			int px0 = col * GLYPH_W, py0 = row * GLYPH_H;
 
 			for (gy = 0; gy < GLYPH_H; gy++) {

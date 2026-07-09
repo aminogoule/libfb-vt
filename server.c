@@ -13,11 +13,13 @@
  *
  * Layers:  fb.c (framebuffer) + vtcon.c (VT ownership) + proto.c (IPC)
  *
- * Usage:  server [-e command] [vtnum]
+ * Usage:  server [-e command] [-w wallpaper.ppm] [vtnum]
  *           -e command : after the VT is grabbed and the socket is up, spawn
  *                        `command` (via /bin/sh -c) as the first client. Handy
  *                        because a locked VT leaves no shell to launch one from,
- *                        e.g.  server -e ./term.svga
+ *                        e.g.  server -e ./term
+ *           -w file    : PPM to use as the desktop wallpaper (stretched to fill
+ *                        the screen). Without it the desktop is a solid colour.
  *           vtnum      : 1-based VT to own (omitted/0 => first free VT).
  *
  * Quit:  SIGINT/SIGTERM/SIGHUP, or automatically once the last client that ever
@@ -28,7 +30,8 @@
 #include "fb.h"
 #include "vtcon.h"
 #include "proto.h"
-#include "font8x8.h"
+#include "ppm.h"
+#include "font8x16.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -48,9 +51,9 @@
 
 #define MAX_SURFACES 16
 #define FRAME         2          /* window border thickness              */
-#define TITLE        16          /* title-bar height                     */
+#define TITLE        20          /* title-bar height                     */
 #define GLYPH_W       8
-#define GLYPH_H       8
+#define GLYPH_H      16
 
 #define BG_DESK   0x2E4055u      /* desktop backdrop (slate blue)        */
 #define CHROME    0xC8CCD4u      /* window frame (light grey)            */
@@ -79,6 +82,7 @@ static surface_t s_surf[MAX_SURFACES];
 static int       s_nsurf   = 0;
 static uint32_t  s_next_id = 1;
 static int       s_had_client = 0;   /* at least one client has connected */
+static img32_t*  s_wall    = NULL;   /* desktop wallpaper (NULL => solid)  */
 
 /* screen draw state (mirrors cube.c's tiny primitive layer) */
 static int      g_w, g_h;
@@ -106,10 +110,30 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c) {
 	}
 }
 
-/* draw one 8x8 glyph; bit 0 of each row byte is the leftmost pixel */
+/* Paint the desktop backdrop: a wallpaper PPM stretched (nearest-neighbour) to
+   fill the whole screen, or a solid colour when no wallpaper is loaded. */
+static void draw_desktop(void) {
+	int x, y;
+
+	if (s_wall == NULL || s_wall->w <= 0 || s_wall->h <= 0) {
+		fill_rect(0, 0, g_w, g_h, BG_DESK);
+		return;
+	}
+	for (y = 0; y < g_h; y++) {
+		int sy = (int)((long)y * s_wall->h / g_h);
+		const uint32_t* srow = &(&s_wall->pixel)[(size_t)sy * s_wall->w];
+		uint32_t* drow = (uint32_t*)(g_buf + (size_t)y * g_pitch);
+		for (x = 0; x < g_w; x++) {
+			int sx = (int)((long)x * s_wall->w / g_w);
+			drow[x] = srow[sx];
+		}
+	}
+}
+
+/* draw one 8x16 glyph; bit 0 of each row byte is the leftmost pixel */
 static void draw_glyph(int x, int y, unsigned char ch, uint32_t col) {
 	int row, bit;
-	const unsigned char* g = font8x8_basic[ch & 0x7F];
+	const unsigned char* g = font8x16_basic[ch];
 	for (row = 0; row < GLYPH_H; row++)
 		for (bit = 0; bit < GLYPH_W; bit++)
 			if (g[row] & (1u << bit))
@@ -158,7 +182,7 @@ static void blit_surface(const surface_t* s) {
 static void composite(void) {
 	int i;
 
-	fill_rect(0, 0, g_w, g_h, BG_DESK);
+	draw_desktop();
 
 	for (i = 0; i < s_nsurf; i++) {
 		surface_t* s = &s_surf[i];
@@ -370,15 +394,18 @@ int main(int argc, char* argv[]) {
 	framebuffer_t* fb  = NULL;
 	char           dev[32];
 	const char*    spawn = NULL;
+	const char*    wall  = NULL;
 	int            vtnum = 0;
 	int            lfd   = -1;
 	int            rc    = EX_OK;
 	int            argi;
 
-	/* args: [-e command] [vtnum] */
+	/* args: [-e command] [-w wallpaper.ppm] [vtnum] */
 	for (argi = 1; argi < argc; argi++) {
 		if (strcmp(argv[argi], "-e") == 0 && argi + 1 < argc)
 			spawn = argv[++argi];
+		else if (strcmp(argv[argi], "-w") == 0 && argi + 1 < argc)
+			wall = argv[++argi];
 		else
 			vtnum = atoi(argv[argi]);
 	}
@@ -411,10 +438,17 @@ int main(int argc, char* argv[]) {
 	        "server: compositor on vt %d, %dx%d %dbpp, socket %s.\n",
 	        con.vtnum, g_w, g_h, fb->info.fb_depth, FBVT_SOCK_PATH);
 
+	if (wall) {
+		s_wall = read_ppm(wall);
+		if (s_wall == NULL)
+			fprintf(stderr, "server: cannot read wallpaper %s: %s "
+			        "(using solid backdrop)\n", wall, strerror(errno));
+	}
+
 	if (spawn)
 		spawn_client(spawn);
 
-	/* first paint: bare desktop */
+	/* first paint: desktop (wallpaper or solid) */
 	g_buf   = (uint8_t*)fb_drawbuf(fb);
 	g_pitch = fb_pitch(fb);
 	composite();
@@ -511,5 +545,6 @@ out:
 	if (fb)
 		fb_close(fb);
 	vtcon_release(&con);
+	free(s_wall);
 	return rc;
 }
