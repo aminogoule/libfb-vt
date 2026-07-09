@@ -567,6 +567,39 @@ static void kin_flush_pending(term_t* t) {
 	t->kin_len   = 0;
 }
 
+/*
+ * Function keys. FreeBSD's vt(4)/syscons keymap emits classic "cons25"-style
+ * codes for F1..F12: bare CSI with final bytes 'M'..'X' (ESC [ M .. ESC [ X),
+ * no parameters. [VERIFY] against the actual keymap in use -- this matches
+ * the well-known FreeBSD console F-key layout, but hasn't been exhaustively
+ * checked across every keymap/console-driver combination; TERM_DEBUG=1
+ * traces the raw incoming sequence so a mismatch is easy to spot and fix.
+ *
+ * TERM=vt100 terminfo only defines kf1..kf4 (the PF1-4 codes ESC O P/Q/R/S)
+ * -- there is no kf5..kf12 at all in a plain vt100 entry. For F5-F10 we use
+ * mc/S-Lang's built-in "Esc then digit" alternate binding (Esc 1..Esc 9 =
+ * F1..F9, Esc 0 = F10), which mc recognises unconditionally, independent of
+ * terminfo -- exactly the escape hatch it exists for. F11/F12 have no such
+ * fallback and are left as a raw passthrough (harmless if unused).
+ */
+static void send_fkey(term_t* t, int n) {
+	unsigned char seq[3];
+
+	if (g_debug)
+		fprintf(stderr, "fkey F%d\n", n);
+
+	if (n >= 1 && n <= 4) {
+		seq[0] = 0x1B; seq[1] = 'O'; seq[2] = (unsigned char)('P' + (n - 1));
+		flush_raw(t, seq, 3);
+	} else if (n >= 5 && n <= 9) {
+		seq[0] = 0x1B; seq[1] = (unsigned char)('0' + n);
+		flush_raw(t, seq, 2);
+	} else if (n == 10) {
+		seq[0] = 0x1B; seq[1] = '0';
+		flush_raw(t, seq, 2);
+	}
+}
+
 static void handle_key_byte(term_t* t, unsigned char b) {
 	switch (t->kin_state) {
 	case KIN_NORM:
@@ -588,11 +621,20 @@ static void handle_key_byte(term_t* t, unsigned char b) {
 
 	case KIN_CSI:
 		if (b >= 0x40 && b <= 0x7E) {        /* final byte: sequence done */
+			if (g_debug) {
+				int i;
+				fprintf(stderr, "key ESC [ ");
+				for (i = 0; i < t->kin_len; i++)
+					fprintf(stderr, "%c", t->kin_buf[i]);
+				fprintf(stderr, "%c\n", b);
+			}
 			if (t->app_cursor_keys && t->kin_len == 0 &&
 			    (b == 'A' || b == 'B' || b == 'C' || b == 'D' ||
 			     b == 'H' || b == 'F')) {
 				unsigned char seq[3] = { 0x1B, 'O', b };
 				flush_raw(t, seq, 3);
+			} else if (t->kin_len == 0 && b >= 'M' && b <= 'X') {
+				send_fkey(t, (int)(b - 'M') + 1);   /* F1..F12 */
 			} else {
 				unsigned char pre[2] = { 0x1B, '[' };
 				flush_raw(t, pre, 2);
