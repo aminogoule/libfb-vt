@@ -11,9 +11,14 @@
  *
  * Emulation is a practical subset: printable text with wrap/scroll, the usual
  * C0 controls (CR/LF/BS/TAB/BEL), CSI cursor moves + erase (A B C D H f G d
- * J K), SGR colours (SGR 0/1/7/30-37/40-47/90-97/100-107/39/49), DEC ?25
- * cursor show/hide, and OSC 0/2 window titles. Enough to run an interactive
- * shell; not a full xterm.
+ * J K), DECSTBM scroll margins + IL/DL/SU/SD, SGR colours -- 16-colour
+ * (0/1/7/30-37/40-47/90-97/100-107/39/49), 256-colour and truecolor
+ * (38/48;5;n and 38/48;2;r;g;b, both stored as full 24-bit RGB per cell),
+ * DECCKM app cursor keys + F-key translation, the DECSET 47/1047/1049
+ * alternate screen, xterm mouse reporting (1000/1002/1006), DEC ?25 cursor
+ * show/hide, and OSC 0/2 window titles. $TERM is "xterm-256color". Enough to
+ * run an interactive shell and reasonably color-accurate image viewers
+ * (chafa, catimg, ...); not a pixel-perfect xterm clone.
  *
  * Usage: term [rows] [cols]      (defaults 25x80, clamped to the granted size)
  * Run wherever it can reach FBVT_SOCK_PATH (root, same host as the server).
@@ -58,6 +63,28 @@ static const uint32_t PAL[16] = {
 	0x5F87D7, 0xE070E0, 0x5FD7D7, 0xFFFFFF,
 };
 
+/* Standard xterm 256-colour palette (SGR 38;5;n / 48;5;n): 0-15 the ANSI
+   colours above, 16-231 a 6x6x6 colour cube, 232-255 a 24-step greyscale
+   ramp. Step values are the well-known xterm constants. */
+static uint32_t xterm256_rgb(int n) {
+	static const uint8_t steps[6] = { 0, 95, 135, 175, 215, 255 };
+	if (n < 0)   n = 0;
+	if (n > 255) n = 255;
+	if (n < 16)
+		return PAL[n];
+	if (n < 232) {
+		int i = n - 16;
+		uint8_t r = steps[(i / 36) % 6];
+		uint8_t g = steps[(i / 6) % 6];
+		uint8_t b = steps[i % 6];
+		return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+	}
+	{
+		uint8_t gray = (uint8_t)(8 + 10 * (n - 232));
+		return ((uint32_t)gray << 16) | ((uint32_t)gray << 8) | (uint32_t)gray;
+	}
+}
+
 typedef struct {
 	uint32_t      cp;         /* Unicode code point in this cell */
 	uint32_t      fg, bg;
@@ -74,7 +101,12 @@ typedef struct {
 
 	/* text grid */
 	int       cols, rows;
-	cell_t*   grid;           /* cols*rows cells */
+	cell_t*   grid;           /* cols*rows cells -- whichever buffer is live */
+	cell_t*   primary_grid;
+	cell_t*   alt_grid;       /* DECSET 1049 alternate screen (xterm-256color
+	                             declares smcup/rmcup; vim uses it)          */
+	int       alt_active;
+	int       alt_saved_cx, alt_saved_cy;
 	int       cx, cy;         /* cursor column/row */
 	uint32_t  cur_fg, cur_bg;
 	int       bold, reverse;
@@ -225,6 +257,24 @@ static void sgr(term_t* t) {
 		else if (p == 7)  t->reverse = 1;
 		else if (p == 22) t->bold = 0;
 		else if (p == 27) t->reverse = 0;
+		else if (p == 38 || p == 48) {
+			/* extended colour: 38/48;5;n (256-colour) or 38/48;2;r;g;b
+			   (truecolor). Consumes the following params as part of this
+			   one SGR attribute -- malformed/truncated forms are just
+			   left unconsumed and fall through harmlessly. */
+			int mode = (i + 1 < t->nparam) ? t->params[i + 1] : -1;
+			if (mode == 5 && i + 2 < t->nparam) {
+				uint32_t col = xterm256_rgb(t->params[i + 2]);
+				if (p == 38) t->cur_fg = col; else t->cur_bg = col;
+				i += 2;
+			} else if (mode == 2 && i + 4 < t->nparam) {
+				uint32_t col = ((uint32_t)(t->params[i + 2] & 0xFF) << 16) |
+				               ((uint32_t)(t->params[i + 3] & 0xFF) << 8) |
+				               (uint32_t)(t->params[i + 4] & 0xFF);
+				if (p == 38) t->cur_fg = col; else t->cur_bg = col;
+				i += 4;
+			}
+		}
 		else if (p >= 30 && p <= 37)   t->cur_fg = PAL[p - 30];
 		else if (p == 39)              t->cur_fg = DEF_FG;
 		else if (p >= 40 && p <= 47)   t->cur_bg = PAL[p - 40];
@@ -245,6 +295,29 @@ static void dec_mode(term_t* t, int on) {
 		switch (p) {
 		case 1:    t->app_cursor_keys = on; break;   /* DECCKM */
 		case 25:   t->cursor_vis = on; break;
+		case 47:
+		case 1047:
+		case 1049:
+			/* alternate screen (xterm-256color's smcup/rmcup). 1049 also
+			   saves/restores the cursor; the simpler 47/1047 don't, but we
+			   treat them the same -- close enough for a terminal that's
+			   never going to be pixel-perfect xterm anyway. */
+			if (on && !t->alt_active) {
+				t->alt_saved_cx = t->cx;
+				t->alt_saved_cy = t->cy;
+				t->grid = t->alt_grid;
+				grid_clear(t);
+				t->cx = t->cy = 0;
+				t->scroll_top = 0;
+				t->scroll_bot = t->rows - 1;
+				t->alt_active = 1;
+			} else if (!on && t->alt_active) {
+				t->grid = t->primary_grid;
+				t->cx = t->alt_saved_cx;
+				t->cy = t->alt_saved_cy;
+				t->alt_active = 0;
+			}
+			break;
 		case 1000:
 		case 1002: t->mouse_mode = on ? p : 0; break;
 		case 1006: t->mouse_sgr  = on; break;
@@ -416,7 +489,9 @@ static void feed(term_t* t, unsigned char ch) {
 			t->state = S_NORM; break;
 		case 'c':                          /* RIS: full reset */
 			t->cur_fg = DEF_FG; t->cur_bg = DEF_BG; t->bold = t->reverse = 0;
-			t->cx = t->cy = 0; t->cursor_vis = 1; grid_clear(t);
+			t->cx = t->cy = 0; t->cursor_vis = 1;
+			t->grid = t->primary_grid; t->alt_active = 0;
+			grid_clear(t);
 			t->scroll_top = 0; t->scroll_bot = t->rows - 1;
 			t->state = S_NORM; break;
 		default: t->state = S_NORM; break;
@@ -570,35 +645,35 @@ static void kin_flush_pending(term_t* t) {
 /*
  * Function keys. Confirmed via TERM_DEBUG=1 on real hardware: this FreeBSD
  * vt(4) keymap emits vt220/Linux-console-style codes, "ESC [ <n> ~" (e.g.
- * F8 = ESC[19~, F9 = ESC[20~, F10 = ESC[21~) -- NOT the cons25 bare-letter
- * form (ESC[M..ESC[X) an earlier version of this code guessed. The <n>..Fn
- * mapping below (11-15,17-24) is the standard vt220/xterm assignment.
+ * F8 = ESC[19~, F9 = ESC[20~, F10 = ESC[21~).
  *
- * TERM=vt100 terminfo only defines kf1..kf4 (the PF1-4 codes ESC O P/Q/R/S)
- * -- there is no kf5..kf12 at all in a plain vt100 entry. For F5-F10 we use
- * mc/S-Lang's built-in "Esc then digit" alternate binding (Esc 1..Esc 9 =
- * F1..F9, Esc 0 = F10), which mc recognises unconditionally, independent of
- * terminfo -- exactly the escape hatch it exists for. F11/F12 have no such
- * fallback and are dropped (nothing sane to send under vt100; harmless if
- * unused).
+ * Now that $TERM is "xterm-256color" (see spawn_shell), its terminfo defines
+ * exactly this: kf1..kf4 = ESC O P/Q/R/S (SS3, same as classic vt100 PF1-4),
+ * kf5..kf12 = ESC [ 15/17/18/19/20/21/23/24 ~ -- i.e. the very same tilde
+ * codes the hardware already sends for F5-F12. So this is mostly a
+ * normalising identity transform (handles the case where some other keymap
+ * sends F1-F4 in tilde form too, converting them to the SS3 form xterm
+ * expects); no mc-specific fallback needed anymore.
  */
 static void send_fkey(term_t* t, int n) {
-	unsigned char seq[3];
+	static const int tilde_code[12] = { 11, 12, 13, 14, 15, 17,
+	                                     18, 19, 20, 21, 23, 24 };
+	unsigned char seq[8];
+	int len;
 
 	if (g_debug)
 		fprintf(stderr, "fkey F%d\n", n);
+	if (n < 1 || n > 12)
+		return;
 
-	if (n >= 1 && n <= 4) {
+	if (n <= 4) {
 		seq[0] = 0x1B; seq[1] = 'O'; seq[2] = (unsigned char)('P' + (n - 1));
 		flush_raw(t, seq, 3);
-	} else if (n >= 5 && n <= 9) {
-		seq[0] = 0x1B; seq[1] = (unsigned char)('0' + n);
-		flush_raw(t, seq, 2);
-	} else if (n == 10) {
-		seq[0] = 0x1B; seq[1] = '0';
-		flush_raw(t, seq, 2);
+		return;
 	}
-	/* n == 11/12: no vt100/mc fallback exists -- dropped */
+	len = snprintf((char*)seq, sizeof(seq), "\033[%d~", tilde_code[n - 1]);
+	if (len > 0)
+		flush_raw(t, seq, (size_t)len);
 }
 
 /* Map a vt220/xterm "ESC [ <code> ~" numeric code to an F-key number, or 0
@@ -800,7 +875,7 @@ static int spawn_shell(term_t* t) {
 	if (pid == 0) {                       /* child: the shell */
 		const char* sh = getenv("SHELL");
 		if (sh == NULL || *sh == '\0') sh = "/bin/sh";
-		setenv("TERM", "vt100", 1);
+		setenv("TERM", "xterm-256color", 1);
 		unsetenv("LINES");
 		unsetenv("COLUMNS");
 		execl(sh, sh, "-i", (char*)NULL);
@@ -850,8 +925,10 @@ int main(int argc, char* argv[]) {
 		goto out;
 	}
 
-	t.grid = calloc((size_t)t.cols * t.rows, sizeof(cell_t));
-	if (t.grid == NULL) { rc = EX_OSERR; goto out; }
+	t.primary_grid = calloc((size_t)t.cols * t.rows, sizeof(cell_t));
+	t.alt_grid     = calloc((size_t)t.cols * t.rows, sizeof(cell_t));
+	if (t.primary_grid == NULL || t.alt_grid == NULL) { rc = EX_OSERR; goto out; }
+	t.grid = t.primary_grid;
 	t.scroll_top = 0;
 	t.scroll_bot = t.rows - 1;
 	grid_clear(&t);
@@ -929,6 +1006,7 @@ out:
 	if (t.pty >= 0)  close(t.pty);
 	if (t.pix && t.pix != MAP_FAILED) munmap(t.pix, t.map_size);
 	if (t.sock >= 0) close(t.sock);
-	free(t.grid);
+	free(t.primary_grid);
+	free(t.alt_grid);
 	return rc;
 }
