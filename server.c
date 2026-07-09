@@ -29,6 +29,7 @@
 
 #include "fb.h"
 #include "vtcon.h"
+#include "mouse.h"
 #include "proto.h"
 #include "ppm.h"
 #include "fontspleen.h"
@@ -83,6 +84,14 @@ static int       s_nsurf   = 0;
 static uint32_t  s_next_id = 1;
 static int       s_had_client = 0;   /* at least one client has connected */
 static img32_t*  s_wall    = NULL;   /* desktop wallpaper (NULL => solid)  */
+
+/* pointer state: /dev/sysmouse, cursor position, click-focus + drag-by-
+   titlebar. A missing/failed mouse device just leaves s_mouse_ok at 0 -- the
+   compositor works keyboard-only either way. */
+static mouse_t   s_mouse;
+static int       s_mouse_ok  = 0;
+static int       s_drag_idx  = -1;   /* index into s_surf being dragged, or -1 */
+static int       s_drag_off_x, s_drag_off_y;  /* mouse offset from surface origin */
 
 /* screen draw state (mirrors cube.c's tiny primitive layer) */
 static int      g_w, g_h;
@@ -191,8 +200,44 @@ static void blit_surface(const surface_t* s) {
 	}
 }
 
+/* The on-screen rect (frame + titlebar + content) of a surface, used for both
+   painting and mouse hit-testing so the two never disagree. */
+static void surface_chrome_rect(const surface_t* s,
+                                 int* ox, int* oy, int* ow, int* oh) {
+	*ox = s->x - FRAME;
+	*oy = s->y - FRAME - TITLE;
+	*ow = s->w + 2 * FRAME;
+	*oh = s->h + 2 * FRAME + TITLE;
+}
+
+/* Simple 12x16 arrow pointer, drawn with a 1px black outline so it stays
+   visible over any background, white fill. Hotspot is the top-left pixel. */
+static void draw_cursor(int mx, int my) {
+	static const uint16_t rows[16] = {
+		0x8000, 0xC000, 0xE000, 0xF000, 0xF800, 0xFC00, 0xFE00, 0xFF00,
+		0xFF80, 0xFE00, 0xEC00, 0xC600, 0x8600, 0x0300, 0x0300, 0x0000,
+	};
+	int row, col;
+
+	for (row = 0; row < 16; row++) {
+		for (col = 0; col < 12; col++) {
+			if (!(rows[row] & (0x8000 >> col)))
+				continue;
+			put_px(mx + col - 1, my + row,     0x000000);
+			put_px(mx + col + 1, my + row,     0x000000);
+			put_px(mx + col,     my + row - 1, 0x000000);
+			put_px(mx + col,     my + row + 1, 0x000000);
+		}
+	}
+	for (row = 0; row < 16; row++)
+		for (col = 0; col < 12; col++)
+			if (rows[row] & (0x8000 >> col))
+				put_px(mx + col, my + row, 0xFFFFFF);
+}
+
 /* Composite the whole scene: desktop, then every surface bottom-to-top with
-   its chrome. The topmost surface (index s_nsurf-1) is the focused one. */
+   its chrome, then the mouse pointer on top. The topmost surface
+   (index s_nsurf-1) is the focused one. */
 static void composite(void) {
 	int i;
 
@@ -206,10 +251,7 @@ static void composite(void) {
 		if (s->pix == NULL)              /* surface not realised yet */
 			continue;
 
-		ox = s->x - FRAME;
-		oy = s->y - FRAME - TITLE;
-		ow = s->w + 2 * FRAME;
-		oh = s->h + 2 * FRAME + TITLE;
+		surface_chrome_rect(s, &ox, &oy, &ow, &oh);
 
 		fill_rect(ox, oy, ow, oh, CHROME);                       /* frame    */
 		fill_rect(ox, oy, ow, TITLE,
@@ -219,6 +261,9 @@ static void composite(void) {
 			            s->title, TITLETX);
 		blit_surface(s);                                         /* pixels   */
 	}
+
+	if (s_mouse_ok)
+		draw_cursor(s_mouse.x, s_mouse.y);
 }
 
 /* ------------------------------------------------------------------ *
@@ -366,6 +411,105 @@ static void route_key(int byte) {
 	(void)fbvt_send(s->fd, &m, NULL);    /* a dead client is reaped on recv */
 }
 
+/* Topmost surface (by chrome rect, frame+titlebar+content) under (mx,my), or
+   -1. *titlebar is set to 1 when the hit was within the titlebar strip. */
+static int surface_at(int mx, int my, int* titlebar) {
+	int i;
+	for (i = s_nsurf - 1; i >= 0; i--) {
+		surface_t* s = &s_surf[i];
+		int ox, oy, ow, oh;
+		if (s->pix == NULL)
+			continue;
+		surface_chrome_rect(s, &ox, &oy, &ow, &oh);
+		if (mx >= ox && mx < ox + ow && my >= oy && my < oy + oh) {
+			if (titlebar)
+				*titlebar = (my < oy + TITLE);
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* Move surface i to the top of the z-order (== focus it). */
+static void surface_raise(int i) {
+	surface_t tmp;
+	if (i < 0 || i == s_nsurf - 1)
+		return;
+	tmp = s_surf[i];
+	memmove(&s_surf[i], &s_surf[i + 1],
+	        (size_t)(s_nsurf - i - 1) * sizeof(s_surf[0]));
+	s_surf[s_nsurf - 1] = tmp;
+}
+
+/* Forward one pointer event to the focused (topmost) surface. (rx,ry) are
+   already relative to that surface's content area. */
+static void route_mouse(int rx, int ry, int buttons, int dz) {
+	surface_t*      s;
+	struct fbvt_msg m;
+
+	if (s_nsurf == 0)
+		return;
+	s = &s_surf[s_nsurf - 1];
+	if (s->id == 0)
+		return;
+
+	memset(&m, 0, sizeof(m));
+	m.type   = FBVT_INPUT_MOUSE;
+	m.id     = s->id;
+	m.arg[0] = rx;
+	m.arg[1] = ry;
+	m.arg[2] = buttons;
+	m.arg[3] = dz;
+	(void)fbvt_send(s->fd, &m, NULL);    /* a dead client is reaped on recv */
+}
+
+/* Handle one round of pointer state: click-to-focus, drag-by-titlebar, and
+   forwarding motion/buttons to the focused surface when the pointer is over
+   its content. Returns 1 if the scene needs recompositing. */
+static int handle_mouse(int prev_buttons) {
+	int pressed = s_mouse.buttons & ~prev_buttons;
+	int dirty   = 1;                     /* the cursor itself always moved */
+
+	if (pressed & MOUSE_BTN_LEFT) {
+		int titlebar = 0;
+		int hit = surface_at(s_mouse.x, s_mouse.y, &titlebar);
+		if (hit >= 0) {
+			surface_raise(hit);
+			if (titlebar) {
+				surface_t* s = &s_surf[s_nsurf - 1];
+				s_drag_idx   = s_nsurf - 1;
+				s_drag_off_x = s_mouse.x - s->x;
+				s_drag_off_y = s_mouse.y - s->y;
+			}
+		}
+	}
+	if (!(s_mouse.buttons & MOUSE_BTN_LEFT))
+		s_drag_idx = -1;
+
+	if (s_drag_idx >= 0) {
+		surface_t* s = &s_surf[s_drag_idx];
+		int nx = s_mouse.x - s_drag_off_x;
+		int ny = s_mouse.y - s_drag_off_y;
+		if (nx < FRAME) nx = FRAME;
+		if (ny < FRAME + TITLE) ny = FRAME + TITLE;
+		if (nx + s->w > g_w - FRAME) nx = g_w - FRAME - s->w;
+		if (ny + s->h > g_h - FRAME) ny = g_h - FRAME - s->h;
+		s->x = nx;
+		s->y = ny;
+	}
+
+	if (s_nsurf > 0) {
+		surface_t* top = &s_surf[s_nsurf - 1];
+		int rx = s_mouse.x - top->x;
+		int ry = s_mouse.y - top->y;
+		if (top->pix != NULL && rx >= 0 && rx < top->w &&
+		    ry >= 0 && ry < top->h)
+			route_mouse(rx, ry, s_mouse.buttons, s_mouse.dz);
+	}
+
+	return dirty;
+}
+
 /* ------------------------------------------------------------------ *
  * Socket setup.                                                       *
  * ------------------------------------------------------------------ */
@@ -448,6 +592,16 @@ int main(int argc, char* argv[]) {
 	g_w = fb->info.fb_width;
 	g_h = fb->info.fb_height;
 
+	s_mouse_ok = (mouse_open(&s_mouse, NULL) == 0);
+	if (s_mouse_ok) {
+		mouse_set_bounds(&s_mouse, g_w - 1, g_h - 1);
+		s_mouse.x = g_w / 2;
+		s_mouse.y = g_h / 2;
+	} else {
+		fprintf(stderr, "server: mouse_open(/dev/sysmouse): %s "
+		        "(running without a pointer)\n", strerror(errno));
+	}
+
 	fprintf(stderr,
 	        "server: compositor on vt %d, %dx%d %dbpp, socket %s.\n",
 	        con.vtnum, g_w, g_h, fb->info.fb_depth, FBVT_SOCK_PATH);
@@ -469,16 +623,25 @@ int main(int argc, char* argv[]) {
 	fb_flip(fb);
 
 	while (!vtcon_quit_requested()) {
-		struct pollfd pfd[2 + MAX_SURFACES];
-		int           npfd = 0;
+		struct pollfd pfd[3 + MAX_SURFACES];
+		int           npfd      = 0;
+		int           mouse_pfd = -1;
+		int           client0;
 		int           dirty = 0;
 		int           key, i, n;
 
 		vtcon_pump(&con);                /* service VT-switch handshake */
 
-		/* build the poll set: keyboard, listener, clients */
+		/* build the poll set: keyboard, mouse, listener, clients */
 		pfd[npfd].fd = con.fd;    pfd[npfd].events = POLLIN; npfd++;
 		pfd[npfd].fd = lfd;       pfd[npfd].events = POLLIN; npfd++;
+		if (s_mouse_ok) {
+			mouse_pfd = npfd;
+			pfd[npfd].fd     = s_mouse.fd;
+			pfd[npfd].events = POLLIN;
+			npfd++;
+		}
+		client0 = npfd;
 		for (i = 0; i < s_nsurf; i++) {
 			pfd[npfd].fd     = s_surf[i].fd;
 			pfd[npfd].events = POLLIN;
@@ -495,6 +658,19 @@ int main(int argc, char* argv[]) {
 		if (pfd[0].revents & POLLIN) {
 			while ((key = vtcon_getkey(&con)) != -1)
 				route_key(key);
+		}
+
+		/* pointer -> click-to-focus / drag / focused client */
+		if (mouse_pfd >= 0 && (pfd[mouse_pfd].revents & POLLIN)) {
+			int prev_buttons = s_mouse.buttons;
+			int r = mouse_poll(&s_mouse);
+			if (r < 0) {
+				mouse_close(&s_mouse);
+				s_mouse_ok = 0;
+			} else if (r > 0) {
+				if (handle_mouse(prev_buttons))
+					dirty = 1;
+			}
 		}
 
 		/* new client connections */
@@ -518,11 +694,11 @@ int main(int argc, char* argv[]) {
 		   pollfd's fd back to its current surface index every time rather than
 		   trusting positional indices. */
 		{
-			int nclients = npfd - 2;
+			int nclients = npfd - client0;
 			int j;
 			for (j = 0; j < nclients; j++) {
-				int   cfd = pfd[2 + j].fd;
-				short re  = pfd[2 + j].revents;
+				int   cfd = pfd[client0 + j].fd;
+				short re  = pfd[client0 + j].revents;
 				if (!(re & (POLLIN | POLLHUP | POLLERR)))
 					continue;
 				for (i = 0; i < s_nsurf; i++)
@@ -556,6 +732,8 @@ out:
 		close(lfd);
 		unlink(FBVT_SOCK_PATH);
 	}
+	if (s_mouse_ok)
+		mouse_close(&s_mouse);
 	if (fb)
 		fb_close(fb);
 	vtcon_release(&con);

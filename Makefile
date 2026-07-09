@@ -30,11 +30,11 @@ LIBUTIL?=	-lutil
 
 PROG_SRC_PPM2FB=	ppm2fb.c ppm.c
 PROG_SRC_FBSHOW=	fbshow.c ppm.c
-PROG_SRC_SERVER=	server.c vtcon.c proto.c ppm.c
+PROG_SRC_SERVER=	server.c vtcon.c mouse.c proto.c ppm.c
 PROG_SRC_CUBE=		cube.c vtcon.c
 PROG_SRC_TERM=		term.c proto.c
 
-HDRS=		fb.h ppm.h vtcon.h fbsvga.h proto.h fontspleen.h
+HDRS=		fb.h ppm.h vtcon.h fbsvga.h mouse.h proto.h fontspleen.h
 
 # term is a display-server *client*: it links no framebuffer backend (it only
 # talks the socket protocol + drives a pty), so it is one backend-independent

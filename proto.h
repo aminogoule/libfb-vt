@@ -35,6 +35,12 @@ enum fbvt_msg_type {
 	FBVT_SET_TITLE,        /* C->S: id; payload = title text (<=PAYLOAD)    */
 	FBVT_DESTROY_SURFACE,  /* C->S: id                                      */
 	FBVT_INPUT_KEY,        /* S->C: id; arg[0]=byte (0..255) from keyboard  */
+	FBVT_INPUT_MOUSE,      /* S->C: id; arg[0]=x arg[1]=y (surface-relative */
+	                       /*        content coords) arg[2]=button bitmask  */
+	                       /*        (bit0=left,1=middle,2=right) arg[3]=   */
+	                       /*        wheel delta (dz). Sent on motion or a  */
+	                       /*        button/wheel change while the pointer  */
+	                       /*        is over the focused surface's content. */
 	FBVT_CLOSE             /* S->C: id; the compositor wants this surface   */
 	                       /*        gone (e.g. on shutdown)                */
 };

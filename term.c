@@ -21,6 +21,7 @@
 
 #include "proto.h"
 #include "fontspleen.h"
+#include "mouse.h"             /* MOUSE_BTN_* bit values (server<->client ABI) */
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -79,6 +80,11 @@ typedef struct {
 	int       bold, reverse;
 	int       cursor_vis;
 	int       saved_cx, saved_cy;
+
+	/* xterm-style mouse reporting (DECSET 1000/1002/1006) */
+	int       mouse_mode;     /* 0 = off, 1000 = click, 1002 = click+drag */
+	int       mouse_sgr;      /* 1 => SGR (1006) coordinate encoding      */
+	int       mouse_buttons;  /* last reported button bitmask, MOUSE_BTN_* */
 
 	/* pty */
 	int       pty;            /* master fd */
@@ -189,6 +195,24 @@ static void sgr(term_t* t) {
 	}
 }
 
+/* DECSET (on=1) / DECRST (on=0) for the private modes we support: cursor
+   visibility (25) and xterm mouse reporting (1000/1002 click modes, 1006 SGR
+   coordinate encoding). A single CSI can carry several params (e.g.
+   "\033[?1000;1006h"), so this walks all of them. */
+static void dec_mode(term_t* t, int on) {
+	int i, n = t->nparam ? t->nparam : 1;
+	for (i = 0; i < n; i++) {
+		int p = param(t, i, 0);
+		switch (p) {
+		case 25:   t->cursor_vis = on; break;
+		case 1000:
+		case 1002: t->mouse_mode = on ? p : 0; break;
+		case 1006: t->mouse_sgr  = on; break;
+		default: break;
+		}
+	}
+}
+
 static void csi_exec(term_t* t, unsigned char final) {
 	int p0 = param(t, 0, 1);
 	int p1 = param(t, 1, 1);
@@ -218,8 +242,8 @@ static void csi_exec(term_t* t, unsigned char final) {
 		}
 		break;
 	}
-	case 'h': if (t->priv && param(t, 0, 0) == 25) t->cursor_vis = 1; break;
-	case 'l': if (t->priv && param(t, 0, 0) == 25) t->cursor_vis = 0; break;
+	case 'h': if (t->priv) dec_mode(t, 1); break;
+	case 'l': if (t->priv) dec_mode(t, 0); break;
 	case 's': t->saved_cx = t->cx; t->saved_cy = t->cy; break;
 	case 'u': t->cx = t->saved_cx; t->cy = t->saved_cy; break;
 	case 'm': sgr(t); break;
@@ -365,6 +389,76 @@ static void feed(term_t* t, unsigned char ch) {
 		break;
 	}
 	t->dirty = 1;
+}
+
+/* ------------------------------------------------------------------ *
+ * xterm-style mouse reporting -> pty.                                 *
+ * ------------------------------------------------------------------ */
+
+/* Encode and send one button/motion report. btn is the xterm button number
+   (0=left,1=middle,2=right,4=wheel-up,5=wheel-down); motion adds the xterm
+   "+32" convention for button-event-tracking drags. col/row are 0-based. */
+static void report_button(term_t* t, int btn, int pressed, int motion,
+                           int col, int row) {
+	char buf[32];
+	int  n, cb, cx, cy;
+
+	cb = btn + (motion ? 32 : 0);
+	cx = col + 1; if (cx > 223) cx = 223; if (cx < 1) cx = 1;
+	cy = row + 1; if (cy > 223) cy = 223; if (cy < 1) cy = 1;
+
+	if (t->mouse_sgr) {
+		n = snprintf(buf, sizeof(buf), "\033[<%d;%d;%d%c",
+		             cb, cx, cy, pressed ? 'M' : 'm');
+		if (n > 0 && n < (int)sizeof(buf))
+			(void)write(t->pty, buf, (size_t)n);
+		return;
+	}
+	/* legacy X10 encoding: fixed 6 bytes, release is always reported as
+	   button 3 (the protocol has no per-button release code). */
+	buf[0] = 0x1B; buf[1] = '['; buf[2] = 'M';
+	buf[3] = (char)(32 + (pressed ? cb : 3));
+	buf[4] = (char)(32 + cx);
+	buf[5] = (char)(32 + cy);
+	(void)write(t->pty, buf, 6);
+}
+
+/* Translate a compositor FBVT_INPUT_MOUSE (pixel coords + button bitmask)
+   into xterm mouse-reporting escape sequences on the pty, if the app running
+   in this terminal has asked for them via DECSET 1000/1002. */
+static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
+	static const int BTN_BIT[3] = { MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
+	                                 MOUSE_BTN_RIGHT };
+	int buttons = m->arg[2];
+	int dz      = m->arg[3];
+	int col     = m->arg[0] / GLYPH_W;
+	int row     = m->arg[1] / GLYPH_H;
+	int changed = buttons ^ t->mouse_buttons;
+	int i;
+
+	if (t->mouse_mode == 0) {
+		t->mouse_buttons = buttons;
+		return;
+	}
+	if (col < 0) col = 0;
+	if (row < 0) row = 0;
+
+	if (dz > 0) report_button(t, 4, 1, 0, col, row);   /* wheel up   */
+	if (dz < 0) report_button(t, 5, 1, 0, col, row);   /* wheel down */
+
+	for (i = 0; i < 3; i++) {
+		if (changed & BTN_BIT[i])
+			report_button(t, i, (buttons & BTN_BIT[i]) != 0, 0, col, row);
+	}
+	if (!changed && buttons != 0 && t->mouse_mode == 1002) {
+		for (i = 0; i < 3; i++) {           /* motion while dragging */
+			if (buttons & BTN_BIT[i]) {
+				report_button(t, i, 1, 1, col, row);
+				break;
+			}
+		}
+	}
+	t->mouse_buttons = buttons;
 }
 
 /* ------------------------------------------------------------------ *
@@ -559,6 +653,8 @@ int main(int argc, char* argv[]) {
 			if (m.type == FBVT_INPUT_KEY) {
 				unsigned char b = (unsigned char)m.arg[0];
 				(void)write(t.pty, &b, 1);
+			} else if (m.type == FBVT_INPUT_MOUSE) {
+				handle_mouse_msg(&t, &m);
 			} else if (m.type == FBVT_CLOSE) {
 				break;
 			}
