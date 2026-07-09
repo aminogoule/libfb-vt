@@ -20,7 +20,7 @@
  */
 
 #include "proto.h"
-#include "font8x16.h"
+#include "fontspleen.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -58,7 +58,7 @@ static const uint32_t PAL[16] = {
 };
 
 typedef struct {
-	unsigned char ch;
+	uint32_t      cp;         /* Unicode code point in this cell */
 	uint32_t      fg, bg;
 } cell_t;
 
@@ -92,6 +92,11 @@ typedef struct {
 	char      osc[FBVT_MAX_PAYLOAD + 1];
 	int       osclen;
 
+	/* UTF-8 decoder (text path only) */
+	int       u8_need;        /* continuation bytes still expected */
+	uint32_t  u8_cp;          /* code point being assembled */
+	uint32_t  u8_min;         /* smallest legal cp (overlong check) */
+
 	int       dirty;
 } term_t;
 
@@ -101,7 +106,7 @@ enum { S_NORM, S_ESC, S_CSI, S_OSC, S_OSC_ESC, S_CHARSET };
  * Grid helpers.                                                       *
  * ------------------------------------------------------------------ */
 static void cell_clear(term_t* t, cell_t* c) {
-	c->ch = ' ';
+	c->cp = ' ';
 	c->fg = t->cur_fg;
 	c->bg = t->cur_bg;
 }
@@ -127,14 +132,14 @@ static void newline(term_t* t) {
 	}
 }
 
-static void put_char(term_t* t, unsigned char ch) {
+static void put_char(term_t* t, uint32_t cp) {
 	cell_t* c;
 	if (t->cx >= t->cols) {          /* deferred wrap */
 		t->cx = 0;
 		newline(t);
 	}
 	c = &t->grid[t->cy * t->cols + t->cx];
-	c->ch = ch;
+	c->cp = cp;
 	c->fg = t->reverse ? t->cur_bg : t->cur_fg;
 	c->bg = t->reverse ? t->cur_fg : t->cur_bg;
 	if (t->bold && !t->reverse)
@@ -248,6 +253,43 @@ static void osc_finish(term_t* t) {
 }
 
 static void feed(term_t* t, unsigned char ch) {
+	/*
+	 * UTF-8 assembly applies only to printable text (state S_NORM): escape and
+	 * C0 control bytes are all < 0x80 and go straight to the state machine, so
+	 * a multibyte sequence can only appear between them. Assemble lead +
+	 * continuation bytes into one code point, then emit a single cell.
+	 */
+	if (t->state == S_NORM) {
+		if (t->u8_need > 0) {
+			if ((ch & 0xC0) == 0x80) {           /* valid continuation */
+				t->u8_cp = (t->u8_cp << 6) | (ch & 0x3F);
+				if (--t->u8_need == 0) {
+					uint32_t cp = t->u8_cp;
+					if (cp < t->u8_min || cp > 0x10FFFF ||
+					    (cp >= 0xD800 && cp <= 0xDFFF))
+						cp = 0xFFFD;             /* overlong/surrogate/OOR */
+					put_char(t, cp);
+					t->dirty = 1;
+				}
+				return;
+			}
+			t->u8_need = 0;                      /* bad seq: drop, reparse ch */
+			put_char(t, 0xFFFD);
+			t->dirty = 1;
+		}
+		if (ch >= 0x80) {                        /* a UTF-8 lead byte */
+			if ((ch & 0xE0) == 0xC0) { t->u8_need = 1; t->u8_cp = ch & 0x1F;
+			                           t->u8_min = 0x80; }
+			else if ((ch & 0xF0) == 0xE0) { t->u8_need = 2; t->u8_cp = ch & 0x0F;
+			                                t->u8_min = 0x800; }
+			else if ((ch & 0xF8) == 0xF0) { t->u8_need = 3; t->u8_cp = ch & 0x07;
+			                                t->u8_min = 0x10000; }
+			else { put_char(t, 0xFFFD); t->dirty = 1; }   /* stray byte */
+			return;
+		}
+		/* ch < 0x80: fall into the normal control/printable handling below */
+	}
+
 	switch (t->state) {
 	case S_NORM:
 		switch (ch) {
@@ -337,7 +379,7 @@ static void render(term_t* t) {
 			int      cur = t->cursor_vis && row == t->cy && col == t->cx;
 			uint32_t fg  = cur ? c->bg : c->fg;
 			uint32_t bg  = cur ? c->fg : c->bg;
-			const unsigned char* g = font8x16_basic[c->ch];
+			const unsigned char* g = glyph_for(c->cp);
 			int px0 = col * GLYPH_W, py0 = row * GLYPH_H;
 
 			for (gy = 0; gy < GLYPH_H; gy++) {

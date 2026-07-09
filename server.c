@@ -31,7 +31,7 @@
 #include "vtcon.h"
 #include "proto.h"
 #include "ppm.h"
-#include "font8x16.h"
+#include "fontspleen.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -131,20 +131,34 @@ static void draw_desktop(void) {
 }
 
 /* draw one 8x16 glyph; bit 0 of each row byte is the leftmost pixel */
-static void draw_glyph(int x, int y, unsigned char ch, uint32_t col) {
+static void draw_glyph(int x, int y, uint32_t cp, uint32_t col) {
 	int row, bit;
-	const unsigned char* g = font8x16_basic[ch];
+	const unsigned char* g = glyph_for(cp);
 	for (row = 0; row < GLYPH_H; row++)
 		for (bit = 0; bit < GLYPH_W; bit++)
 			if (g[row] & (1u << bit))
 				put_px(x + bit, y + row, col);
 }
 
+/* draw a UTF-8 string; each decoded code point is one glyph cell */
 static void draw_string(int x, int y, const char* s, uint32_t col) {
-	for (; *s; s++, x += GLYPH_W) {
-		if (*s == '\t' || *s == '\n' || *s == '\r')
+	const unsigned char* p = (const unsigned char*)s;
+	while (*p) {
+		uint32_t cp = *p;
+		int      n = 1, i;
+		if      ((*p & 0xE0) == 0xC0) { cp = *p & 0x1F; n = 2; }
+		else if ((*p & 0xF0) == 0xE0) { cp = *p & 0x0F; n = 3; }
+		else if ((*p & 0xF8) == 0xF0) { cp = *p & 0x07; n = 4; }
+		else if (*p >= 0x80)          { cp = 0xFFFD;    n = 1; }
+		for (i = 1; i < n; i++) {
+			if ((p[i] & 0xC0) != 0x80) { cp = 0xFFFD; n = 1; break; }
+			cp = (cp << 6) | (p[i] & 0x3F);
+		}
+		p += n;
+		if (cp == '\t' || cp == '\n' || cp == '\r')
 			continue;
-		draw_glyph(x, y, (unsigned char)*s, col);
+		draw_glyph(x, y, cp, col);
+		x += GLYPH_W;
 	}
 }
 
