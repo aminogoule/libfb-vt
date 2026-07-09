@@ -49,12 +49,6 @@ fb:   ppm2fb.fb   fbshow.fb    server.fb   cube.fb
 term: $(PROG_SRC_TERM) proto.h fontspleen.h
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_TERM) $(LIBUTIL)
 
-# forced, always-rebuilt debug build: traces every executed CSI sequence to
-# stderr (same as TERM_DEBUG=1 ./term, just without needing the env var set
-# in whatever wrapper spawns it, e.g. `server -e ./term`).
-term-debug: $(PROG_SRC_TERM) proto.h fontspleen.h
-	$(CC) $(CFLAGS) -DTERM_FORCE_DEBUG -o term $(PROG_SRC_TERM) $(LIBUTIL)
-
 # ---- VMware SVGA II (linear + HW 2D) --------------------------------
 ppm2fb.svga: $(PROG_SRC_PPM2FB) fb_svga.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_PPM2FB) fb_svga.c
@@ -93,4 +87,4 @@ clean:
 	      term \
 	      *.o
 
-.PHONY: all svga vga fb clean term-debug
+.PHONY: all svga vga fb clean
