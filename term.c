@@ -751,7 +751,11 @@ int main(int argc, char* argv[]) {
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, SIG_IGN);              /* auto-reap the shell */
 
+#ifdef TERM_FORCE_DEBUG
+	g_debug = 1;                       /* baked in by `make term-debug` */
+#else
 	g_debug = (getenv("TERM_DEBUG") != NULL);
+#endif
 
 	memset(&t, 0, sizeof(t));
 	t.sock = t.pty = -1;
