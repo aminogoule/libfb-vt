@@ -139,6 +139,9 @@ int kbd_feed(kbd_t* k, int code, unsigned char* buf) {
 	if (sc == 0x57) return send_fkey(k, 11, buf);
 	if (sc == 0x58) return send_fkey(k, 12, buf);
 
+	if (sc >= (int)(sizeof(UNSHIFT) / sizeof(UNSHIFT[0])))
+		return 0;                     /* out of table range: unmapped */
+
 	{
 		char ch = k->shift ? SHIFT[sc] : UNSHIFT[sc];
 		if (ch == 0)
