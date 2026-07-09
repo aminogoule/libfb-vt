@@ -568,19 +568,19 @@ static void kin_flush_pending(term_t* t) {
 }
 
 /*
- * Function keys. FreeBSD's vt(4)/syscons keymap emits classic "cons25"-style
- * codes for F1..F12: bare CSI with final bytes 'M'..'X' (ESC [ M .. ESC [ X),
- * no parameters. [VERIFY] against the actual keymap in use -- this matches
- * the well-known FreeBSD console F-key layout, but hasn't been exhaustively
- * checked across every keymap/console-driver combination; TERM_DEBUG=1
- * traces the raw incoming sequence so a mismatch is easy to spot and fix.
+ * Function keys. Confirmed via TERM_DEBUG=1 on real hardware: this FreeBSD
+ * vt(4) keymap emits vt220/Linux-console-style codes, "ESC [ <n> ~" (e.g.
+ * F8 = ESC[19~, F9 = ESC[20~, F10 = ESC[21~) -- NOT the cons25 bare-letter
+ * form (ESC[M..ESC[X) an earlier version of this code guessed. The <n>..Fn
+ * mapping below (11-15,17-24) is the standard vt220/xterm assignment.
  *
  * TERM=vt100 terminfo only defines kf1..kf4 (the PF1-4 codes ESC O P/Q/R/S)
  * -- there is no kf5..kf12 at all in a plain vt100 entry. For F5-F10 we use
  * mc/S-Lang's built-in "Esc then digit" alternate binding (Esc 1..Esc 9 =
  * F1..F9, Esc 0 = F10), which mc recognises unconditionally, independent of
  * terminfo -- exactly the escape hatch it exists for. F11/F12 have no such
- * fallback and are left as a raw passthrough (harmless if unused).
+ * fallback and are dropped (nothing sane to send under vt100; harmless if
+ * unused).
  */
 static void send_fkey(term_t* t, int n) {
 	unsigned char seq[3];
@@ -598,6 +598,43 @@ static void send_fkey(term_t* t, int n) {
 		seq[0] = 0x1B; seq[1] = '0';
 		flush_raw(t, seq, 2);
 	}
+	/* n == 11/12: no vt100/mc fallback exists -- dropped */
+}
+
+/* Map a vt220/xterm "ESC [ <code> ~" numeric code to an F-key number, or 0
+   if it isn't one (Insert=2, Delete=3, PageUp=5, PageDown=6, Home=1/7,
+   End=4/8 all use the same '~'-terminated form and are left untranslated). */
+static int fkey_from_tilde(int code) {
+	switch (code) {
+	case 11: return 1;
+	case 12: return 2;
+	case 13: return 3;
+	case 14: return 4;
+	case 15: return 5;
+	case 17: return 6;
+	case 18: return 7;
+	case 19: return 8;
+	case 20: return 9;
+	case 21: return 10;
+	case 23: return 11;
+	case 24: return 12;
+	default: return 0;
+	}
+}
+
+/* Parse the buffered CSI parameter bytes (decimal digits only) as one
+   integer. Returns -1 if empty or not purely digits (e.g. "1;5" for a
+   modifier combo -- out of scope here, left to the passthrough path). */
+static int kin_buf_to_int(const term_t* t) {
+	int i, v = 0;
+	if (t->kin_len == 0)
+		return -1;
+	for (i = 0; i < t->kin_len; i++) {
+		if (t->kin_buf[i] < '0' || t->kin_buf[i] > '9')
+			return -1;
+		v = v * 10 + (t->kin_buf[i] - '0');
+	}
+	return v;
 }
 
 static void handle_key_byte(term_t* t, unsigned char b) {
@@ -633,8 +670,9 @@ static void handle_key_byte(term_t* t, unsigned char b) {
 			     b == 'H' || b == 'F')) {
 				unsigned char seq[3] = { 0x1B, 'O', b };
 				flush_raw(t, seq, 3);
-			} else if (t->kin_len == 0 && b >= 'M' && b <= 'X') {
-				send_fkey(t, (int)(b - 'M') + 1);   /* F1..F12 */
+			} else if (b == '~' && fkey_from_tilde(kin_buf_to_int(t))) {
+				int fn = fkey_from_tilde(kin_buf_to_int(t));
+				send_fkey(t, fn);
 			} else {
 				unsigned char pre[2] = { 0x1B, '[' };
 				flush_raw(t, pre, 2);
