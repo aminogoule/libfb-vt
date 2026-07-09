@@ -13,13 +13,20 @@
  *
  * Layers:  fb.c (framebuffer) + vtcon.c (VT ownership) + proto.c (IPC)
  *
- * Usage:  server [-e command] [-w wallpaper.ppm] [vtnum]
+ * Usage:  server [-e command] [-w wallpaper.ppm] [-k] [vtnum]
  *           -e command : after the VT is grabbed and the socket is up, spawn
  *                        `command` (via /bin/sh -c) as the first client. Handy
  *                        because a locked VT leaves no shell to launch one from,
  *                        e.g.  server -e ./term
  *           -w file    : PPM to use as the desktop wallpaper (stretched to fill
  *                        the screen). Without it the desktop is a solid colour.
+ *           -k         : read the keyboard as raw K_CODE scancodes (kbd.h)
+ *                        instead of K_XLATE, to recover Shift/Ctrl/Alt
+ *                        modifier state for combos like Shift+Arrow that
+ *                        K_XLATE's pre-baked translation can't express.
+ *                        Off by default: K_XLATE already handles plain
+ *                        typing/arrows/F-keys. $KBD_DEBUG=1 traces decoded
+ *                        scancodes to stderr.
  *           vtnum      : 1-based VT to own (omitted/0 => first free VT).
  *
  * Quit:  SIGINT/SIGTERM/SIGHUP, or automatically once the last client that ever
@@ -30,6 +37,7 @@
 #include "fb.h"
 #include "vtcon.h"
 #include "mouse.h"
+#include "kbd.h"
 #include "proto.h"
 #include "ppm.h"
 #include "fontspleen.h"
@@ -92,6 +100,14 @@ static mouse_t   s_mouse;
 static int       s_mouse_ok  = 0;
 static int       s_drag_idx  = -1;   /* index into s_surf being dragged, or -1 */
 static int       s_drag_off_x, s_drag_off_y;  /* mouse offset from surface origin */
+
+/* raw-scancode keyboard decoding (opt-in via -k, see kbd.h). Off by default
+   -- K_XLATE already handles plain typing/arrows/F-keys correctly; K_CODE is
+   only needed to recover modifier state (Shift+Arrow etc.) that K_XLATE's
+   pre-baked translation throws away. */
+static int       s_kbd_raw   = 0;
+static kbd_t     s_kbd;
+static int       s_kbd_debug = 0;   /* $KBD_DEBUG: trace scancodes to stderr */
 
 /* screen draw state (mirrors cube.c's tiny primitive layer) */
 static int      g_w, g_h;
@@ -558,15 +574,18 @@ int main(int argc, char* argv[]) {
 	int            rc    = EX_OK;
 	int            argi;
 
-	/* args: [-e command] [-w wallpaper.ppm] [vtnum] */
+	/* args: [-e command] [-w wallpaper.ppm] [-k] [vtnum] */
 	for (argi = 1; argi < argc; argi++) {
 		if (strcmp(argv[argi], "-e") == 0 && argi + 1 < argc)
 			spawn = argv[++argi];
 		else if (strcmp(argv[argi], "-w") == 0 && argi + 1 < argc)
 			wall = argv[++argi];
+		else if (strcmp(argv[argi], "-k") == 0)
+			s_kbd_raw = 1;
 		else
 			vtnum = atoi(argv[argi]);
 	}
+	s_kbd_debug = (getenv("KBD_DEBUG") != NULL);
 
 	signal(SIGPIPE, SIG_IGN);            /* dead-client writes => EPIPE  */
 	signal(SIGCHLD, SIG_IGN);            /* auto-reap spawned clients    */
@@ -574,6 +593,16 @@ int main(int argc, char* argv[]) {
 	if (vtcon_acquire(&con, vtnum) != 0) {
 		fprintf(stderr, "vtcon_acquire: %s\n", strerror(errno));
 		return EX_OSERR;
+	}
+
+	if (s_kbd_raw) {
+		if (vtcon_set_keyboard_raw(&con, 1) != 0) {
+			fprintf(stderr, "server: vtcon_set_keyboard_raw: %s "
+			        "(falling back to K_XLATE)\n", strerror(errno));
+			s_kbd_raw = 0;
+		} else {
+			kbd_init(&s_kbd);
+		}
 	}
 
 	snprintf(dev, sizeof(dev), "/dev/ttyv%d", con.vtnum - 1);
@@ -656,8 +685,21 @@ int main(int argc, char* argv[]) {
 
 		/* keyboard -> focused client (drain all pending bytes) */
 		if (pfd[0].revents & POLLIN) {
-			while ((key = vtcon_getkey(&con)) != -1)
-				route_key(key);
+			if (s_kbd_raw) {
+				while ((key = vtcon_get_scancode(&con)) != -1) {
+					unsigned char kbuf[8];
+					int           n = kbd_feed(&s_kbd, key, kbuf);
+					int           j;
+					if (s_kbd_debug)
+						fprintf(stderr, "sc 0x%02x -> %d byte%s\n",
+						        key, n, n == 1 ? "" : "s");
+					for (j = 0; j < n; j++)
+						route_key(kbuf[j]);
+				}
+			} else {
+				while ((key = vtcon_getkey(&con)) != -1)
+					route_key(key);
+			}
 		}
 
 		/* pointer -> click-to-focus / drag / focused client */

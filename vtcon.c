@@ -147,6 +147,27 @@ int vtcon_getkey(vtcon_t* c) {
 	return -1;
 }
 
+int vtcon_set_keyboard_raw(vtcon_t* c, int raw) {
+	int mode = raw ? K_CODE : K_XLATE;
+	if (ioctl(c->fd, KDSKBMODE, mode) == -1)
+		return -1;
+	c->kbd_raw = raw ? 1 : 0;
+	return 0;
+}
+
+/* Same read mechanism as vtcon_getkey() -- KDSKBMODE just changes what the
+   kernel hands back on this fd, not how we read it. Kept as a separate,
+   distinctly-named function so callers don't accidentally mix ASCII and
+   raw-scancode reads under the same name. */
+int vtcon_get_scancode(vtcon_t* c) {
+	unsigned char ch;
+	if (c->fd < 0)
+		return -1;
+	if (read(c->fd, &ch, 1) == 1)
+		return (int)ch;
+	return -1;
+}
+
 /*
  * Interpret keyboard input as a "quit or not" decision, tolerant of escape
  * sequences. The keyboard is in K_XLATE, so arrow keys, Home/End, function
@@ -208,6 +229,10 @@ void vtcon_release(vtcon_t* c) {
 
 	if (c->fd != -1) {
 		(void)write(c->fd, "\033[?25h", 6);        /* restore cursor */
+		if (c->kbd_raw) {
+			ioctl(c->fd, KDSKBMODE, K_XLATE);
+			c->kbd_raw = 0;
+		}
 		if (c->graphics)
 			ioctl(c->fd, KDSETMODE, KD_TEXT);
 		if (c->have_saved_vtmode) {
