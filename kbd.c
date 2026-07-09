@@ -110,6 +110,31 @@ int kbd_feed(kbd_t* k, int code, unsigned char* buf) {
 	if (is_break)
 		return 0;                 /* only key-down produces output */
 
+	/*
+	 * Extended (cursor/nav) keys. Confirmed via KBD_DEBUG=1 on real
+	 * hardware: this console's K_CODE does NOT use the classic AT 0xE0
+	 * prefix at all -- Home/Up/PgUp/Left/Right/End/Down/PgDn/Ins/Del
+	 * arrive as a flat, direct run of codes 0x5E-0x67. The `ext`
+	 * (0xE0-prefixed) branch below is kept as a defensive fallback for
+	 * keyboards/drivers that *do* use the standard AT encoding, but has
+	 * not been observed to fire on the hardware this was tested on.
+	 */
+	if (!ext) {
+		switch (sc) {
+		case 0x5E: return send_cursor(k, 'H', buf);   /* Home    */
+		case 0x5F: return send_cursor(k, 'A', buf);   /* Up      */
+		case 0x60: return send_tilde(k, 5, buf);      /* PgUp    */
+		case 0x61: return send_cursor(k, 'D', buf);   /* Left    */
+		case 0x62: return send_cursor(k, 'C', buf);   /* Right   */
+		case 0x63: return send_cursor(k, 'F', buf);   /* End     */
+		case 0x64: return send_cursor(k, 'B', buf);   /* Down    */
+		case 0x65: return send_tilde(k, 6, buf);      /* PgDn    */
+		case 0x66: return send_tilde(k, 2, buf);      /* Insert  */
+		case 0x67: return send_tilde(k, 3, buf);      /* Delete  */
+		default: break;
+		}
+	}
+
 	if (ext) {
 		switch (sc) {
 		case 0x48: return send_cursor(k, 'A', buf);   /* Up    */

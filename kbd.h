@@ -9,13 +9,16 @@
  * express -- Shift+Arrow (xterm "ESC[1;2A"), Ctrl+Arrow, etc. -- reach an
  * application at all.
  *
- * The scancode table is the standard AT/PS2 "set 1" layout, US QWERTY, with
- * 0xE0 as the two-byte extended-key prefix (arrows, Home/End, Ins/Del,
- * PgUp/PgDn, right Ctrl/Alt, keypad Enter/divide) -- the same code space
- * every x86 keyboard controller has used since the original IBM PC, and
- * what K_CODE is documented to hand back. [VERIFY] on real hardware via
- * KBD_DEBUG=1 (see server.c) before relying on it -- this has been built
- * from the documented layout, not confirmed against this specific console.
+ * Letters/digits/punctuation/Enter/Backspace/Esc/Tab/F1-F12 are the standard
+ * AT/PS2 "set 1" layout, US QWERTY -- confirmed against KBD_DEBUG=1 logs on
+ * real hardware. Cursor/nav keys (Home/Up/PgUp/Left/Right/End/Down/PgDn/
+ * Ins/Del) are also confirmed, but NOT via the classic 0xE0-prefixed
+ * extended-key scheme every x86 keyboard controller has used since the
+ * original IBM PC (as the set-1 docs would suggest) -- this console's
+ * K_CODE instead hands them back as a flat, direct run of codes 0x5E-0x67,
+ * no prefix at all. The 0xE0-prefixed path is kept in kbd.c as a defensive
+ * fallback (in case some other keyboard/driver combo does use it) but has
+ * not been observed to fire here.
  */
 
 typedef struct {
