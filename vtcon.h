@@ -33,6 +33,7 @@ typedef struct {
 	int  active;             /* 1 while our VT is the visible one         */
 	int  graphics;           /* 1 if KD_GRAPHICS is currently set         */
 	int  lock_switch;        /* 1 => refuse VT switches while we own it   */
+	int  kbd_raw;            /* 1 if K_CODE is set (see vtcon_set_keyboard_raw) */
 
 	/* saved state for a clean restore */
 	struct vt_mode saved_vtmode;
@@ -62,6 +63,25 @@ void vtcon_set_switch_lock(vtcon_t* c, int on);
 /* Non-blocking read of one input byte from the VT keyboard (K_XLATE).
    Returns the byte (0..255), or -1 if nothing is pending. */
 int  vtcon_getkey(vtcon_t* c);
+
+/*
+ * Switch the keyboard between K_XLATE (default -- vtcon_getkey() returns
+ * keymap-translated ASCII/ANSI bytes, arrow keys etc. arrive pre-encoded as
+ * escape sequences) and K_CODE (vtcon_get_scancode() returns raw make/break
+ * scancodes; nothing is translated for you -- no free letters, Ctrl+C, or
+ * arrow-key escape sequences. Needed only to recover modifier state (e.g.
+ * Shift+Arrow) that K_XLATE's pre-baked translation throws away).
+ * Returns 0/-1 (errno set); on failure the mode is left unchanged.
+ */
+int  vtcon_set_keyboard_raw(vtcon_t* c, int raw);
+
+/* Non-blocking read of one raw K_CODE scancode. Low 7 bits are the scan
+   code (standard AT/PS2 "set 1": 0x01..0x58 base keys, 0xE0 as a
+   two-byte-sequence prefix for the extended keys -- arrows, Home/End,
+   Ins/Del, PgUp/PgDn, right Ctrl/Alt, keypad Enter/divide), bit 0x80 marks a
+   break (key-up). Returns the raw byte (0..255) exactly as read, or -1 if
+   nothing is pending or the keyboard isn't in raw mode. */
+int  vtcon_get_scancode(vtcon_t* c);
 
 /* Drain all pending keyboard input and report whether the user asked to quit.
    Returns 1 for 'q'/'Q' or a standalone ESC keypress, 0 otherwise. Arrow keys
