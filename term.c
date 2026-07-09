@@ -81,6 +81,7 @@ typedef struct {
 	int       cursor_vis;
 	int       saved_cx, saved_cy;
 	int       scroll_top, scroll_bot;  /* DECSTBM margins, 0-based inclusive */
+	int       app_cursor_keys;         /* DECCKM: 1 => arrows report ESC O x */
 
 	/* xterm-style mouse reporting (DECSET 1000/1002/1006) */
 	int       mouse_mode;     /* 0 = off, 1000 = click, 1002 = click+drag */
@@ -90,6 +91,11 @@ typedef struct {
 	/* pty */
 	int       pty;            /* master fd */
 	pid_t     child;
+
+	/* keyboard -> pty escape rewriter (see handle_key_byte) */
+	int           kin_state;   /* KIN_* */
+	unsigned char kin_buf[8];  /* CSI intermediates/params buffered so far */
+	int           kin_len;
 
 	/* escape parser */
 	int       state;          /* S_* */
@@ -108,6 +114,12 @@ typedef struct {
 } term_t;
 
 enum { S_NORM, S_ESC, S_CSI, S_OSC, S_OSC_ESC, S_CHARSET };
+enum { KIN_NORM, KIN_ESC, KIN_CSI };
+
+/* set from $TERM_DEBUG at startup; traces executed CSI sequences to stderr
+   so scroll/margin issues in real apps (vim, mc) can be diagnosed without
+   guessing. */
+static int g_debug;
 
 /* ------------------------------------------------------------------ *
  * Grid helpers.                                                       *
@@ -231,6 +243,7 @@ static void dec_mode(term_t* t, int on) {
 	for (i = 0; i < n; i++) {
 		int p = param(t, i, 0);
 		switch (p) {
+		case 1:    t->app_cursor_keys = on; break;   /* DECCKM */
 		case 25:   t->cursor_vis = on; break;
 		case 1000:
 		case 1002: t->mouse_mode = on ? p : 0; break;
@@ -243,6 +256,16 @@ static void dec_mode(term_t* t, int on) {
 static void csi_exec(term_t* t, unsigned char final) {
 	int p0 = param(t, 0, 1);
 	int p1 = param(t, 1, 1);
+
+	if (g_debug) {
+		int i;
+		fprintf(stderr, "csi %sfinal=%c params=[",
+		        t->priv ? "? " : "", final);
+		for (i = 0; i < t->nparam; i++)
+			fprintf(stderr, "%s%d", i ? ";" : "", t->params[i]);
+		fprintf(stderr, "] cy=%d cx=%d top=%d bot=%d\n",
+		        t->cy, t->cx, t->scroll_top, t->scroll_bot);
+	}
 
 	switch (final) {
 	case 'A': t->cy -= p0; if (t->cy < 0) t->cy = 0; break;
@@ -509,6 +532,85 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Keyboard -> pty: rewrite cursor-key escapes for DECCKM.             *
+ *                                                                      *
+ * The raw bytes forwarded by the compositor are whatever the vt(4)    *
+ * console keymap emits, which is always the ANSI/normal form          *
+ * (ESC [ A/B/C/D/H/F). But curses apps built against the "vt100"      *
+ * terminfo entry define arrow keys as the SS3 application form        *
+ * (ESC O A/B/C/D/H/F) and switch modes with DECCKM (CSI ?1h / ?1l).   *
+ * Since we never actually retarget the keyboard hardware, we rewrite  *
+ * the outgoing bytes here instead: bare (parameter-less) cursor-key   *
+ * sequences get their '[' swapped for 'O' while app_cursor_keys is    *
+ * set; everything else (Home/End with modifiers, PgUp/PgDn, function  *
+ * keys, ordinary text) passes through untouched.                      *
+ * ------------------------------------------------------------------ */
+static void flush_raw(term_t* t, const unsigned char* buf, size_t n) {
+	(void)write(t->pty, buf, n);
+}
+
+/* Flush whatever is currently buffered in the keyboard parser as-is (used
+   on a genuine standalone ESC, or when a sequence times out unterminated).
+   Returns the parser to KIN_NORM. */
+static void kin_flush_pending(term_t* t) {
+	unsigned char esc = 0x1B;
+	if (t->kin_state == KIN_NORM)
+		return;
+	flush_raw(t, &esc, 1);
+	if (t->kin_state == KIN_CSI) {
+		unsigned char lb = '[';
+		flush_raw(t, &lb, 1);
+		if (t->kin_len)
+			flush_raw(t, t->kin_buf, (size_t)t->kin_len);
+	}
+	t->kin_state = KIN_NORM;
+	t->kin_len   = 0;
+}
+
+static void handle_key_byte(term_t* t, unsigned char b) {
+	switch (t->kin_state) {
+	case KIN_NORM:
+		if (b == 0x1B) { t->kin_state = KIN_ESC; return; }
+		flush_raw(t, &b, 1);
+		return;
+
+	case KIN_ESC:
+		if (b == '[') {
+			t->kin_state = KIN_CSI;
+			t->kin_len   = 0;
+			return;
+		}
+		/* not a CSI intro (e.g. a real standalone Escape keypress
+		   immediately followed by ordinary text): flush both bytes as-is */
+		kin_flush_pending(t);
+		flush_raw(t, &b, 1);
+		return;
+
+	case KIN_CSI:
+		if (b >= 0x40 && b <= 0x7E) {        /* final byte: sequence done */
+			if (t->app_cursor_keys && t->kin_len == 0 &&
+			    (b == 'A' || b == 'B' || b == 'C' || b == 'D' ||
+			     b == 'H' || b == 'F')) {
+				unsigned char seq[3] = { 0x1B, 'O', b };
+				flush_raw(t, seq, 3);
+			} else {
+				unsigned char pre[2] = { 0x1B, '[' };
+				flush_raw(t, pre, 2);
+				if (t->kin_len)
+					flush_raw(t, t->kin_buf, (size_t)t->kin_len);
+				flush_raw(t, &b, 1);
+			}
+			t->kin_state = KIN_NORM;
+			t->kin_len   = 0;
+			return;
+		}
+		if (t->kin_len < (int)sizeof(t->kin_buf))
+			t->kin_buf[t->kin_len++] = b;
+		return;
+	}
+}
+
+/* ------------------------------------------------------------------ *
  * Rendering: grid -> shm buffer, then COMMIT.                         *
  * ------------------------------------------------------------------ */
 static void render(term_t* t) {
@@ -649,6 +751,8 @@ int main(int argc, char* argv[]) {
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, SIG_IGN);              /* auto-reap the shell */
 
+	g_debug = (getenv("TERM_DEBUG") != NULL);
+
 	memset(&t, 0, sizeof(t));
 	t.sock = t.pty = -1;
 	t.cur_fg = DEF_FG; t.cur_bg = DEF_BG;
@@ -692,6 +796,8 @@ int main(int argc, char* argv[]) {
 		n = poll(pfd, 2, 16);
 		if (n < 0 && errno != EINTR)
 			break;
+		if (n == 0)                       /* idle tick: don't leave a real */
+			kin_flush_pending(&t);        /* Escape/truncated CSI hanging  */
 
 		/* input keys from the compositor -> the pty */
 		if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
@@ -701,7 +807,7 @@ int main(int argc, char* argv[]) {
 				break;                     /* compositor gone */
 			if (m.type == FBVT_INPUT_KEY) {
 				unsigned char b = (unsigned char)m.arg[0];
-				(void)write(t.pty, &b, 1);
+				handle_key_byte(&t, b);
 			} else if (m.type == FBVT_INPUT_MOUSE) {
 				handle_mouse_msg(&t, &m);
 			} else if (m.type == FBVT_CLOSE) {
