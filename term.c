@@ -80,6 +80,7 @@ typedef struct {
 	int       bold, reverse;
 	int       cursor_vis;
 	int       saved_cx, saved_cy;
+	int       scroll_top, scroll_bot;  /* DECSTBM margins, 0-based inclusive */
 
 	/* xterm-style mouse reporting (DECSET 1000/1002/1006) */
 	int       mouse_mode;     /* 0 = off, 1000 = click, 1002 = click+drag */
@@ -123,19 +124,45 @@ static void grid_clear(term_t* t) {
 		cell_clear(t, &t->grid[i]);
 }
 
-static void scroll_up(term_t* t) {
+/* erase cells [from,to) in the linear grid -- forward-declared here, defined
+   below param(); needed by the scroll helpers. */
+static void erase_span(term_t* t, int from, int to);
+
+/* Scroll rows [top,bot] (0-based, inclusive) of the grid up/down by n lines,
+   pulling in blank lines at the vacated edge. This is the primitive behind
+   LF/RI at the scroll margins and the DECSTBM-aware CSI L/M/S/T sequences --
+   vim and mc both rely on the terminal actually performing these (rather
+   than silently ignoring them) to keep their cursor bookkeeping in sync with
+   what's on screen. */
+static void region_scroll_up(term_t* t, int top, int bot, int n) {
+	int span = bot - top + 1;
 	int i;
-	memmove(t->grid, t->grid + t->cols,
-	        (size_t)(t->cols * (t->rows - 1)) * sizeof(cell_t));
-	for (i = 0; i < t->cols; i++)
-		cell_clear(t, &t->grid[t->cols * (t->rows - 1) + i]);
+	if (n <= 0 || span <= 0) return;
+	if (n > span) n = span;
+	if (n < span)
+		memmove(&t->grid[top * t->cols], &t->grid[(top + n) * t->cols],
+		        (size_t)(span - n) * t->cols * sizeof(cell_t));
+	for (i = bot - n + 1; i <= bot; i++)
+		erase_span(t, i * t->cols, (i + 1) * t->cols);
+}
+
+static void region_scroll_down(term_t* t, int top, int bot, int n) {
+	int span = bot - top + 1;
+	int i;
+	if (n <= 0 || span <= 0) return;
+	if (n > span) n = span;
+	if (n < span)
+		memmove(&t->grid[(top + n) * t->cols], &t->grid[top * t->cols],
+		        (size_t)(span - n) * t->cols * sizeof(cell_t));
+	for (i = top; i < top + n; i++)
+		erase_span(t, i * t->cols, (i + 1) * t->cols);
 }
 
 static void newline(term_t* t) {
-	if (++t->cy >= t->rows) {
-		t->cy = t->rows - 1;
-		scroll_up(t);
-	}
+	if (t->cy == t->scroll_bot)
+		region_scroll_up(t, t->scroll_top, t->scroll_bot, 1);
+	else if (t->cy < t->rows - 1)
+		t->cy++;
 }
 
 static void put_char(term_t* t, uint32_t cp) {
@@ -247,6 +274,26 @@ static void csi_exec(term_t* t, unsigned char final) {
 	case 's': t->saved_cx = t->cx; t->saved_cy = t->cy; break;
 	case 'u': t->cx = t->saved_cx; t->cy = t->saved_cy; break;
 	case 'm': sgr(t); break;
+	case 'r': {                           /* DECSTBM: set scroll margins */
+		int top = param(t, 0, 1) - 1;
+		int bot = param(t, 1, t->rows) - 1;
+		if (top < 0) top = 0;
+		if (bot >= t->rows) bot = t->rows - 1;
+		if (top < bot) { t->scroll_top = top; t->scroll_bot = bot; }
+		else            { t->scroll_top = 0;  t->scroll_bot = t->rows - 1; }
+		t->cx = 0; t->cy = t->scroll_top;      /* DECSTBM homes the cursor */
+		break;
+	}
+	case 'L':                             /* IL: insert Ps blank lines */
+		if (t->cy >= t->scroll_top && t->cy <= t->scroll_bot)
+			region_scroll_down(t, t->cy, t->scroll_bot, p0);
+		break;
+	case 'M':                             /* DL: delete Ps lines */
+		if (t->cy >= t->scroll_top && t->cy <= t->scroll_bot)
+			region_scroll_up(t, t->cy, t->scroll_bot, p0);
+		break;
+	case 'S': region_scroll_up(t, t->scroll_top, t->scroll_bot, p0); break;
+	case 'T': region_scroll_down(t, t->scroll_top, t->scroll_bot, p0); break;
 	default: break;                       /* unsupported: ignore */
 	}
 	if (t->cx < 0) t->cx = 0;
@@ -339,15 +386,15 @@ static void feed(term_t* t, unsigned char ch) {
 		case ']': t->state = S_OSC; t->osclen = 0; break;
 		case '(': case ')': t->state = S_CHARSET; break;
 		case 'M':                          /* reverse index: up + scroll */
-			if (t->cy == 0) {
-				memmove(t->grid + t->cols, t->grid,
-				        (size_t)(t->cols * (t->rows - 1)) * sizeof(cell_t));
-				erase_span(t, 0, t->cols);
-			} else t->cy--;
+			if (t->cy == t->scroll_top)
+				region_scroll_down(t, t->scroll_top, t->scroll_bot, 1);
+			else if (t->cy > 0)
+				t->cy--;
 			t->state = S_NORM; break;
 		case 'c':                          /* RIS: full reset */
 			t->cur_fg = DEF_FG; t->cur_bg = DEF_BG; t->bold = t->reverse = 0;
 			t->cx = t->cy = 0; t->cursor_vis = 1; grid_clear(t);
+			t->scroll_top = 0; t->scroll_bot = t->rows - 1;
 			t->state = S_NORM; break;
 		default: t->state = S_NORM; break;
 		}
@@ -621,6 +668,8 @@ int main(int argc, char* argv[]) {
 
 	t.grid = calloc((size_t)t.cols * t.rows, sizeof(cell_t));
 	if (t.grid == NULL) { rc = EX_OSERR; goto out; }
+	t.scroll_top = 0;
+	t.scroll_bot = t.rows - 1;
 	grid_clear(&t);
 
 	if (spawn_shell(&t) != 0) {
