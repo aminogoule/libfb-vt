@@ -11,10 +11,17 @@
  *   1. NO I/O ports. The index/value register protocol is gone. Registers are
  *      a plain 32-bit array memory-mapped in BAR0. Register index i lives at
  *      byte offset i*4 (matches vmwgfx: `u32 __iomem *rmmio; rmmio[i]`).
- *   2. NO legacy FIFO. There is no command ring, so no HW RECT_FILL/RECT_COPY
- *      and no SVGA_CMD_UPDATE. In this legacy display mode the device scans
- *      out guest VRAM continuously, so a plain write to the framebuffer shows
- *      up with no explicit present -- fb_svga_update() is a no-op here.
+ *   2. NO legacy FIFO. There is no command ring. 2D and present commands are
+ *      instead submitted through COMMAND BUFFERS: a 64-byte SVGACBHeader (in
+ *      guest-visible memory) points at a stream of {u32 cmdId, payload...}
+ *      commands, and its physical address is poked into COMMAND_HIGH/LOW. We
+ *      carve the header + stream out of the VRAM tail (whose physical address
+ *      we know) so the device can DMA it, enable command-buffer context 0 once
+ *      at open, and use it for SVGA_CMD_UPDATE (present) and hardware
+ *      SVGA_CMD_RECT_COPY (screen blit). There is no HW solid-fill command on
+ *      SVGA, so fb_svga_fill is a software fill + present. If the device lacks
+ *      SVGA_CAP_COMMAND_BUFFERS (or a submission fails) we fall back to a
+ *      SVGA_REG_SYNC poke for present and software copy.
  *
  * Because there is no port I/O, this backend is architecture-independent: it
  * builds and runs on amd64 AND arm64 (the common SVGA3 case: FreeBSD/arm64 in
@@ -70,8 +77,55 @@ enum {
 	SVGA_REG_CAPABILITIES    = 17,
 	SVGA_REG_SYNC            = 21,   /* write => flush/present traced regions */
 	SVGA_REG_BUSY            = 22,   /* non-zero while the device is working  */
-	SVGA_REG_TRACES          = 45    /* auto-present VRAM writes (legacy)   */
+	SVGA_REG_TRACES          = 45,   /* auto-present VRAM writes (legacy)   */
+	SVGA_REG_COMMAND_LOW     = 48,   /* cmd-buffer header PA low | context  */
+	SVGA_REG_COMMAND_HIGH    = 49    /* cmd-buffer header PA high 32 bits   */
 };
+
+/* device capabilities (SVGA_REG_CAPABILITIES) */
+#define SVGA_CAP_RECT_COPY        0x00000002u
+#define SVGA_CAP_COMMAND_BUFFERS  0x01000000u
+
+/* ------------------------------------------------------------------ *
+ * Command buffers -- the ONLY way to submit 2D/present commands on    *
+ * SVGA3 (there is no FIFO). A 64-byte SVGACBHeader points at a stream *
+ * of {u32 cmdId, payload...} commands; its physical address is poked  *
+ * into COMMAND_HIGH/LOW (context id in the low bits of LOW). We place  *
+ * both header and command stream in the tail of VRAM, whose physical  *
+ * address we know, so the device can DMA them.                        *
+ * ------------------------------------------------------------------ */
+
+/* SVGACBHeader, laid out to match the device (natural alignment already
+   yields the required 64 bytes -- asserted below, so no packing needed).
+   The union in the spec is collapsed to its physical-address ("pa") form. */
+typedef struct {
+	uint32_t status;        /* SVGACBStatus: 0 NONE, 1 COMPLETED, ... */
+	uint32_t errorOffset;
+	uint64_t id;
+	uint32_t flags;         /* SVGACBFlags: 0 == NONE                 */
+	uint32_t length;        /* command stream length in bytes         */
+	uint64_t pa;            /* physical address of the command stream */
+	uint32_t offset;
+	uint32_t dxContext;
+	uint32_t mustBeZero[6];
+} svga_cb_header_t;
+typedef char svga_cb_header_size_check[sizeof(svga_cb_header_t) == 64 ? 1 : -1];
+
+#define SVGA_CB_STATUS_NONE       0u
+#define SVGA_CB_STATUS_COMPLETED  1u
+#define SVGA_CB_FLAG_NONE         0u
+#define SVGA_CB_CONTEXT_0         0x00u   /* regular (2D/present) commands */
+#define SVGA_CB_CONTEXT_DEVICE    0x3fu   /* device-management commands    */
+
+/* device-context command ids */
+#define SVGA_DC_CMD_START_STOP_CONTEXT  1u
+
+/* legacy 2D command ids (valid in a context-0 command buffer) */
+#define SVGA_CMD_UPDATE      1u    /* {x, y, w, h}                       */
+#define SVGA_CMD_RECT_COPY   3u    /* {srcX, srcY, dstX, dstY, w, h}     */
+
+#define VMWARE_VENDOR  0x15AD
+#define SVGA3_DEVICE   0x0406
 
 /* SVGA_MAKE_ID(v) == (0x900000 << 8) | v */
 #define SVGA_ID_2   0x90000002u
@@ -98,8 +152,17 @@ static size_t    s_regs_len = 0;
 
 static void*     s_vram     = NULL;         /* mmap'd BAR2 (whole VRAM)   */
 static size_t    s_vram_len = 0;
+static uint64_t  s_vram_phys = 0;           /* BAR2 physical base         */
 static uint32_t  s_fb_offset = 0;           /* visible frame offset       */
+static uint32_t  s_caps      = 0;           /* SVGA_REG_CAPABILITIES      */
 static int       s_open     = 0;            /* device brought up          */
+
+/* command-buffer scratch carved from the VRAM tail (see the CB comment) */
+static int                s_cb_ok   = 0;    /* context 0 up, CBs usable   */
+static volatile svga_cb_header_t* s_cb_hdr = NULL;
+static volatile uint32_t*         s_cb_cmd = NULL;   /* command stream     */
+static uint64_t           s_cb_hdr_phys = 0;
+static uint64_t           s_cb_cmd_phys = 0;
 
 /* register state captured at open, restored on close so the vt(4) console
    scanout comes back (SVGA3 has no VGA text emulation to fall back to) */
@@ -111,6 +174,70 @@ static __inline void svga_write(int reg, uint32_t val) {
 }
 static __inline uint32_t svga_read(int reg) {
 	return s_regs[reg];
+}
+
+/* ------------------------------------------------------------------ *
+ * Command-buffer submission.                                         *
+ * ------------------------------------------------------------------ */
+
+/* Submit the command stream already written at s_cb_cmd (len bytes) under the
+   given context, and wait (bounded) for the device to complete it. Returns 0
+   on SVGA_CB_STATUS_COMPLETED, -1 otherwise. */
+static int cb_submit(uint32_t context, uint32_t len) {
+	volatile svga_cb_header_t* h = s_cb_hdr;
+	int i, guard = 10000000;
+
+	h->status      = SVGA_CB_STATUS_NONE;
+	h->errorOffset = 0;
+	h->id          = 0;
+	h->flags       = SVGA_CB_FLAG_NONE;
+	h->length      = len;
+	h->pa          = s_cb_cmd_phys;
+	h->offset      = 0;
+	h->dxContext   = 0;
+	for (i = 0; i < 6; i++)
+		h->mustBeZero[i] = 0;
+
+	__sync_synchronize();   /* header + commands must land before the kick */
+
+	/* HIGH first, then LOW -- the LOW write (carrying the context in its low
+	   bits; the 64-byte-aligned header keeps them free) triggers processing. */
+	svga_write(SVGA_REG_COMMAND_HIGH, (uint32_t)(s_cb_hdr_phys >> 32));
+	svga_write(SVGA_REG_COMMAND_LOW,
+	           (uint32_t)(s_cb_hdr_phys & 0xffffffffu) | context);
+
+	while (h->status == SVGA_CB_STATUS_NONE && guard-- > 0)
+		__sync_synchronize();
+
+	return (h->status == SVGA_CB_STATUS_COMPLETED) ? 0 : -1;
+}
+
+/* enable(1)/disable(0) command-buffer context 0 via the device context */
+static int cb_start_context0(int enable) {
+	volatile uint32_t* c = s_cb_cmd;
+	c[0] = SVGA_DC_CMD_START_STOP_CONTEXT;
+	c[1] = (uint32_t)enable;
+	c[2] = SVGA_CB_CONTEXT_0;
+	return cb_submit(SVGA_CB_CONTEXT_DEVICE, 3 * (uint32_t)sizeof(uint32_t));
+}
+
+/* present a dirty rectangle (SVGA_CMD_UPDATE) via context 0 */
+static int cb_update(int x, int y, int w, int h) {
+	volatile uint32_t* c = s_cb_cmd;
+	c[0] = SVGA_CMD_UPDATE;
+	c[1] = (uint32_t)x; c[2] = (uint32_t)y;
+	c[3] = (uint32_t)w; c[4] = (uint32_t)h;
+	return cb_submit(SVGA_CB_CONTEXT_0, 5 * (uint32_t)sizeof(uint32_t));
+}
+
+/* hardware screen-to-screen blit (SVGA_CMD_RECT_COPY) via context 0 */
+static int cb_rect_copy(int sx, int sy, int dx, int dy, int w, int h) {
+	volatile uint32_t* c = s_cb_cmd;
+	c[0] = SVGA_CMD_RECT_COPY;
+	c[1] = (uint32_t)sx; c[2] = (uint32_t)sy;
+	c[3] = (uint32_t)dx; c[4] = (uint32_t)dy;
+	c[5] = (uint32_t)w;  c[6] = (uint32_t)h;
+	return cb_submit(SVGA_CB_CONTEXT_0, 7 * (uint32_t)sizeof(uint32_t));
 }
 
 /* ------------------------------------------------------------------ *
@@ -209,7 +336,8 @@ framebuffer_t* fb_svga_open(int width, int height, int bpp, int db) {
 	              MAP_SHARED, s_mem_fd, (off_t)regs_base);
 	if (s_regs == MAP_FAILED) { s_regs = NULL; goto fail; }
 
-	s_vram_len = (size_t)vram_len;
+	s_vram_len  = (size_t)vram_len;
+	s_vram_phys = vram_base;
 	s_vram = mmap(NULL, s_vram_len, PROT_READ | PROT_WRITE,
 	              MAP_SHARED, s_mem_fd, (off_t)vram_base);
 	if (s_vram == MAP_FAILED) { s_vram = NULL; goto fail; }
@@ -257,6 +385,29 @@ framebuffer_t* fb_svga_open(int width, int height, int bpp, int db) {
 		goto fail;
 	}
 
+	/* Set up command buffers if the device supports them: carve one page from
+	   the very tail of VRAM for the header + command stream (well past the
+	   visible frame), then start context 0. On any failure we simply run
+	   without acceleration -- present falls back to a SVGA_REG_SYNC poke and
+	   copy/fill run in software. */
+	s_caps  = svga_read(SVGA_REG_CAPABILITIES);
+	s_cb_ok = 0;
+	if (s_caps & SVGA_CAP_COMMAND_BUFFERS) {
+		size_t fb_end = (size_t)s_fb_offset + fb->stride * (size_t)height;
+		size_t region = 4096;                 /* one page: 64B header + stream */
+		if (s_vram_len > region) {
+			size_t off = (s_vram_len - region) & ~((size_t)0xfff);  /* page-aligned */
+			if (off >= fb_end) {
+				s_cb_hdr      = (volatile svga_cb_header_t*)((uint8_t*)s_vram + off);
+				s_cb_cmd      = (volatile uint32_t*)((uint8_t*)s_vram + off + 64);
+				s_cb_hdr_phys = s_vram_phys + off;
+				s_cb_cmd_phys = s_cb_hdr_phys + 64;
+				if (cb_start_context0(1) == 0)
+					s_cb_ok = 1;
+			}
+		}
+	}
+
 	if (db) {
 		fb->back = malloc(fb->back_stride * (size_t)height);
 		/* if this fails we simply run single-buffered (draw into VRAM) */
@@ -276,6 +427,10 @@ framebuffer_t* fb_open(const char* dev, int db) {
 
 void fb_close(framebuffer_t* fb) {
 	if (s_open) {
+		if (s_cb_ok) {
+			(void)cb_start_context0(0);       /* stop command-buffer context 0 */
+			s_cb_ok = 0;
+		}
 		if (s_saved) {
 			/* restore the console's original scanout mode and present it */
 			svga_write(SVGA_REG_ENABLE, SVGA_REG_ENABLE_DISABLE);
@@ -374,19 +529,23 @@ int fb_resize(framebuffer_t* fb, int width, int height) {
  * ------------------------------------------------------------------ */
 
 /*
- * Present. SVGA3 has no FIFO, so there is no SVGA_CMD_UPDATE to enqueue. The
- * device tracks CPU writes to the framebuffer (traces) but only flushes them
- * to the visible screen on a device access -- without this, pixels sit in VRAM
- * and appear "stuck" until some unrelated register touch (e.g. a keypress path)
- * happens to force a VM exit. So we poke SVGA_REG_SYNC and drain SVGA_REG_BUSY:
- * the register access forces the host to present the dirty framebuffer region.
- * The BUSY drain is bounded so a device that never advertises BUSY can't hang.
+ * Present a dirty rectangle. SVGA3 has no FIFO, so the proper present is an
+ * SVGA_CMD_UPDATE submitted through a command buffer (context 0) -- this both
+ * names the changed region and forces the host to scan it out. If command
+ * buffers are unavailable (or a submission fails) we fall back to poking
+ * SVGA_REG_SYNC and draining SVGA_REG_BUSY: the register access alone forces
+ * the host to flush traced framebuffer writes. Without either, pixels sit in
+ * VRAM and appear "stuck" until some unrelated register touch (e.g. a keypress
+ * path) happens to force a VM exit. The BUSY drain is bounded so a device that
+ * never advertises BUSY can't hang.
  */
 int fb_svga_update(framebuffer_t* fb, int x, int y, int w, int h) {
 	int guard = 1000000;
-	(void)fb; (void)x; (void)y; (void)w; (void)h;
+	(void)fb;
 	if (!s_open)
 		return -1;
+	if (s_cb_ok && cb_update(x, y, w, h) == 0)
+		return 0;
 	svga_write(SVGA_REG_SYNC, 1);
 	while (guard-- > 0 && svga_read(SVGA_REG_BUSY))
 		;
@@ -408,12 +567,16 @@ void fb_svga_enable(framebuffer_t* fb, int on) {
 	}
 }
 
-/* SVGA3 without command buffers has no hardware 2D exposed here. */
+/* HW accel available when command buffers are up and the device advertises the
+   screen-to-screen copy command. (There is no HW solid-fill command on SVGA;
+   fb_svga_fill is always software, then presented.) */
 int fb_svga_have_accel(framebuffer_t* fb) {
 	(void)fb;
-	return 0;
+	return (s_cb_ok && (s_caps & SVGA_CAP_RECT_COPY)) ? 1 : 0;
 }
 
+/* Solid fill. SVGA has no RECT_FILL command, so this is always a software fill
+   into VRAM followed by a present of the touched rectangle. */
 int fb_svga_fill(framebuffer_t* fb, int x, int y, int w, int h, uint32_t color) {
 	int      row, col;
 	uint8_t* base = (uint8_t*)fb->vram;
@@ -426,9 +589,13 @@ int fb_svga_fill(framebuffer_t* fb, int x, int y, int w, int h, uint32_t color) 
 		for (col = 0; col < w; col++)
 			line[x + col] = color;
 	}
-	return 0;
+	return fb_svga_update(fb, x, y, w, h);
 }
 
+/* Screen-to-screen blit. Uses the hardware SVGA_CMD_RECT_COPY via a command
+   buffer when available (ideal for console scroll / window drag: no CPU pixel
+   traffic), else an overlap-safe software memmove within VRAM. Either way the
+   destination rectangle is presented. */
 int fb_svga_copy(framebuffer_t* fb, int sx, int sy, int dx, int dy, int w, int h) {
 	int      row;
 	uint8_t* base = (uint8_t*)fb->vram;
@@ -436,6 +603,13 @@ int fb_svga_copy(framebuffer_t* fb, int sx, int sy, int dx, int dy, int w, int h
 
 	if (w <= 0 || h <= 0)
 		return -1;
+
+	if (s_cb_ok && (s_caps & SVGA_CAP_RECT_COPY)) {
+		/* the device performs the move and presents the result itself */
+		if (cb_rect_copy(sx, sy, dx, dy, w, h) == 0)
+			return 0;
+		/* fall through to the software path on a submission error */
+	}
 
 	/* memmove rows within VRAM, overlap-safe (top-down or bottom-up) */
 	if (dy <= sy) {
@@ -449,5 +623,5 @@ int fb_svga_copy(framebuffer_t* fb, int sx, int sy, int dx, int dy, int w, int h
 			        base + (size_t)(sy + row) * fb->stride + (size_t)sx * bpp,
 			        (size_t)w * bpp);
 	}
-	return 0;
+	return fb_svga_update(fb, dx, dy, w, h);
 }

@@ -241,12 +241,16 @@ API `fb.h`. Выбирайте по одному на бинарник; Makefile
   отдельный бэкенд:
   - **нет I/O-портов** — регистры отображены в BAR0 (индекс `i` = слово по смещению `i*4`),
     поэтому `/dev/io` не нужен и бэкенд **архитектурно-независим** (собирается и на arm64);
-  - **нет легаси-FIFO** — аппаратного 2D нет (`fill`/`copy` только программные); present
-    делается «пинком» устройства: `fb_svga_update()` пишет `SVGA_REG_SYNC` и опрашивает
-    `SVGA_REG_BUSY` — сам доступ к регистру форсит показ трейснутых изменений VRAM (иначе
-    пиксели «залипают» в памяти до постороннего обращения к устройству, напр. нажатия
-    клавиши). При выходе исходный режим регистров восстанавливается, чтобы вернулась
-    консоль (у SVGA3 нет VGA-текстовой эмуляции);
+  - **нет легаси-FIFO** — 2D и present идут через **command buffers**: 64-байтный
+    `SVGACBHeader` + поток команд размещаются в хвосте VRAM (физадрес известен, устройство
+    читает DMA), при открытии включается контекст 0, физадрес заголовка пишется в
+    `SVGA_REG_COMMAND_LOW/HIGH`. Через это: present — `SVGA_CMD_UPDATE` (dirty-rect), а
+    `fb_svga_copy` — аппаратный `SVGA_CMD_RECT_COPY` (гейтится `SVGA_CAP_RECT_COPY`;
+    идеально для скролла/перетаскивания окон). HW-команды сплошной заливки у SVGA нет,
+    поэтому `fb_svga_fill` — программная заливка + present. Если `SVGA_CAP_COMMAND_BUFFERS`
+    нет или сабмит не прошёл — откат на «пинок» `SVGA_REG_SYNC` для present и программный
+    copy. При выходе контекст 0 останавливается, исходный режим регистров восстанавливается,
+    чтобы вернулась консоль (у SVGA3 нет VGA-текстовой эмуляции);
   - BAR0 = регистры, **BAR2 = VRAM** (у SVGA II было BAR1/BAR2), базы и длины берутся
     через `PCIOCGETBAR` (корректно и для 64-битных BAR).
 
@@ -411,8 +415,14 @@ Which one you need:
   VMware Fusion gives **arm64** / UEFI guests). Why it needs its own backend:
   - **no I/O ports** — registers live in BAR0 (index `i` = word at byte `i*4`), so
     no `/dev/io` and the backend is **architecture-independent** (builds on arm64);
-  - **no legacy FIFO** — no hardware 2D (`fill`/`copy` are software) and present is
-    implicit: the device scans out VRAM continuously, so `fb_svga_update()` is a no-op;
+  - **no legacy FIFO** — 2D and present go through **command buffers**: a 64-byte
+    `SVGACBHeader` + command stream placed in the VRAM tail (physical address known,
+    device DMAs it), context 0 started at open, header PA poked into
+    `SVGA_REG_COMMAND_LOW/HIGH`. Present is `SVGA_CMD_UPDATE` (dirty-rect) and
+    `fb_svga_copy` is hardware `SVGA_CMD_RECT_COPY` (gated on `SVGA_CAP_RECT_COPY`;
+    ideal for scroll / window drag). SVGA has no HW solid-fill, so `fb_svga_fill` is
+    a software fill + present. No `SVGA_CAP_COMMAND_BUFFERS` (or a failed submit) →
+    fall back to a `SVGA_REG_SYNC` poke for present and software copy;
   - BAR0 = registers, **BAR2 = VRAM** (SVGA II used BAR1/BAR2); bases and lengths
     come from `PCIOCGETBAR` (64-bit-BAR safe).
 
