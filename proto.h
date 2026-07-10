@@ -35,6 +35,12 @@ enum fbvt_msg_type {
 	FBVT_SET_TITLE,        /* C->S: id; payload = title text (<=PAYLOAD)    */
 	FBVT_DESTROY_SURFACE,  /* C->S: id                                      */
 	FBVT_INPUT_KEY,        /* S->C: id; arg[0]=byte (0..255) from keyboard  */
+	FBVT_INPUT_KEYSEQ,     /* S->C: id; payload = 1..8 raw bytes belonging  */
+	                       /*        to a single keypress (see kbd.c),      */
+	                       /*        delivered atomically so the client's   */
+	                       /*        escape-sequence parser never sees a    */
+	                       /*        poll-timing gap in the middle of a     */
+	                       /*        multi-byte CSI sequence                */
 	FBVT_INPUT_MOUSE,      /* S->C: id; arg[0]=x arg[1]=y (surface-relative */
 	                       /*        content coords) arg[2]=button bitmask  */
 	                       /*        (bit0=left,1=middle,2=right) arg[3]=   */

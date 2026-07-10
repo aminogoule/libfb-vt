@@ -959,12 +959,20 @@ int main(int argc, char* argv[]) {
 		/* input keys from the compositor -> the pty */
 		if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
 			struct fbvt_msg m;
-			int             r = fbvt_recv(t.sock, &m, NULL, 0, NULL);
+			unsigned char   seqbuf[8];
+			int             r = fbvt_recv(t.sock, &m, seqbuf, sizeof(seqbuf), NULL);
 			if (r <= 0)
 				break;                     /* compositor gone */
 			if (m.type == FBVT_INPUT_KEY) {
 				unsigned char b = (unsigned char)m.arg[0];
 				handle_key_byte(&t, b);
+			} else if (m.type == FBVT_INPUT_KEYSEQ) {
+				/* all bytes of one keypress, fed with no poll gap between
+				   them so a scheduling delay can't split a CSI sequence
+				   and desync the parser (see kin_flush_pending) */
+				uint32_t i;
+				for (i = 0; i < m.paylen && i < sizeof(seqbuf); i++)
+					handle_key_byte(&t, seqbuf[i]);
 			} else if (m.type == FBVT_INPUT_MOUSE) {
 				handle_mouse_msg(&t, &m);
 			} else if (m.type == FBVT_CLOSE) {

@@ -427,6 +427,26 @@ static void route_key(int byte) {
 	(void)fbvt_send(s->fd, &m, NULL);    /* a dead client is reaped on recv */
 }
 
+/* Forward a whole keypress's worth of bytes (e.g. a decoded CSI escape
+   sequence from kbd_feed()) to the focused surface in one message, so the
+   client's parser sees them with no gap a poll timeout could land in. */
+static void route_keyseq(const unsigned char* buf, int n) {
+	surface_t*      s;
+	struct fbvt_msg m;
+
+	if (s_nsurf == 0 || n <= 0)
+		return;
+	s = &s_surf[s_nsurf - 1];            /* focused == topmost */
+	if (s->id == 0)
+		return;
+
+	memset(&m, 0, sizeof(m));
+	m.type   = FBVT_INPUT_KEYSEQ;
+	m.id     = s->id;
+	m.paylen = (uint32_t)n;
+	(void)fbvt_send(s->fd, &m, buf);     /* a dead client is reaped on recv */
+}
+
 /* Topmost surface (by chrome rect, frame+titlebar+content) under (mx,my), or
    -1. *titlebar is set to 1 when the hit was within the titlebar strip. */
 static int surface_at(int mx, int my, int* titlebar) {
@@ -689,12 +709,11 @@ int main(int argc, char* argv[]) {
 				while ((key = vtcon_get_scancode(&con)) != -1) {
 					unsigned char kbuf[8];
 					int           n = kbd_feed(&s_kbd, key, kbuf);
-					int           j;
 					if (s_kbd_debug)
 						fprintf(stderr, "sc 0x%02x -> %d byte%s\n",
 						        key, n, n == 1 ? "" : "s");
-					for (j = 0; j < n; j++)
-						route_key(kbuf[j]);
+					if (n > 0)
+						route_keyseq(kbuf, n);
 				}
 			} else {
 				while ((key = vtcon_getkey(&con)) != -1)
