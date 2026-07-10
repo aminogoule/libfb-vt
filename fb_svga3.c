@@ -52,6 +52,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "fb.h"
 #include "fbsvga.h"
@@ -158,6 +159,7 @@ static uint32_t  s_caps      = 0;           /* SVGA_REG_CAPABILITIES      */
 static int       s_open     = 0;            /* device brought up          */
 
 /* command-buffer scratch carved from the VRAM tail (see the CB comment) */
+static int                s_dbg     = 0;    /* $FBSVGA_DEBUG: trace bring-up */
 static int                s_cb_ok   = 0;    /* context 0 up, CBs usable   */
 static volatile svga_cb_header_t* s_cb_hdr = NULL;
 static volatile uint32_t*         s_cb_cmd = NULL;   /* command stream     */
@@ -390,6 +392,7 @@ framebuffer_t* fb_svga_open(int width, int height, int bpp, int db) {
 	   visible frame), then start context 0. On any failure we simply run
 	   without acceleration -- present falls back to a SVGA_REG_SYNC poke and
 	   copy/fill run in software. */
+	s_dbg   = (getenv("FBSVGA_DEBUG") != NULL);
 	s_caps  = svga_read(SVGA_REG_CAPABILITIES);
 	s_cb_ok = 0;
 	if (s_caps & SVGA_CAP_COMMAND_BUFFERS) {
@@ -398,14 +401,27 @@ framebuffer_t* fb_svga_open(int width, int height, int bpp, int db) {
 		if (s_vram_len > region) {
 			size_t off = (s_vram_len - region) & ~((size_t)0xfff);  /* page-aligned */
 			if (off >= fb_end) {
+				int rc;
 				s_cb_hdr      = (volatile svga_cb_header_t*)((uint8_t*)s_vram + off);
 				s_cb_cmd      = (volatile uint32_t*)((uint8_t*)s_vram + off + 64);
 				s_cb_hdr_phys = s_vram_phys + off;
 				s_cb_cmd_phys = s_cb_hdr_phys + 64;
-				if (cb_start_context0(1) == 0)
+				rc = cb_start_context0(1);
+				if (rc == 0)
 					s_cb_ok = 1;
+				if (s_dbg)
+					fprintf(stderr, "fb_svga3: caps=0x%08x cmdbuf=yes "
+					        "hdr_phys=0x%llx ctx0 start rc=%d status=%u errOff=%u\n",
+					        s_caps, (unsigned long long)s_cb_hdr_phys, rc,
+					        s_cb_hdr->status, s_cb_hdr->errorOffset);
+			} else if (s_dbg) {
+				fprintf(stderr, "fb_svga3: CB region would overlap the "
+				        "framebuffer -- disabled\n");
 			}
 		}
+	} else if (s_dbg) {
+		fprintf(stderr, "fb_svga3: caps=0x%08x cmdbuf=NO -> SYNC present, "
+		        "software copy\n", s_caps);
 	}
 
 	if (db) {
@@ -544,8 +560,21 @@ int fb_svga_update(framebuffer_t* fb, int x, int y, int w, int h) {
 	(void)fb;
 	if (!s_open)
 		return -1;
-	if (s_cb_ok && cb_update(x, y, w, h) == 0)
-		return 0;
+	if (s_cb_ok) {
+		int rc = cb_update(x, y, w, h);
+		if (s_dbg) {                          /* report the first present only */
+			static int once = 0;
+			if (!once) {
+				once = 1;
+				fprintf(stderr, "fb_svga3: first CB present rc=%d status=%u "
+				        "errOff=%u%s\n", rc, s_cb_hdr->status,
+				        s_cb_hdr->errorOffset,
+				        rc == 0 ? "" : " -> SYNC fallback");
+			}
+		}
+		if (rc == 0)
+			return 0;
+	}
 	svga_write(SVGA_REG_SYNC, 1);
 	while (guard-- > 0 && svga_read(SVGA_REG_BUSY))
 		;
