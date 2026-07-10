@@ -127,6 +127,7 @@ static int       s_menu_x, s_menu_y;
 static int       s_kbd_raw   = 0;
 static kbd_t     s_kbd;
 static int       s_kbd_debug = 0;   /* $KBD_DEBUG: trace scancodes to stderr */
+static int       s_mouse_debug = 0; /* $MOUSE_DEBUG: trace dx/dy/dz/buttons  */
 
 /* screen draw state (mirrors cube.c's tiny primitive layer) */
 static int      g_w, g_h;
@@ -722,6 +723,7 @@ int main(int argc, char* argv[]) {
 			vtnum = atoi(argv[argi]);
 	}
 	s_kbd_debug = (getenv("KBD_DEBUG") != NULL);
+	s_mouse_debug = (getenv("MOUSE_DEBUG") != NULL);
 
 	signal(SIGPIPE, SIG_IGN);            /* dead-client writes => EPIPE  */
 	signal(SIGCHLD, SIG_IGN);            /* auto-reap spawned clients    */
@@ -845,6 +847,9 @@ int main(int argc, char* argv[]) {
 				mouse_close(&s_mouse);
 				s_mouse_ok = 0;
 			} else if (r > 0) {
+				if (s_mouse_debug && s_mouse.dz != 0)
+					fprintf(stderr, "mouse dz=%d buttons=0x%x\n",
+					        s_mouse.dz, s_mouse.buttons);
 				if (handle_mouse(prev_buttons))
 					dirty = 1;
 			}
