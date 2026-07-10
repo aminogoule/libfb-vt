@@ -70,7 +70,7 @@ void mouse_close(mouse_t* m) {
 #include <dev/evdev/input.h>
 
 #ifndef MOUSE_EVDEV_DEFAULT
-#define MOUSE_EVDEV_DEFAULT "/dev/input/event3"
+#define MOUSE_EVDEV_DEFAULT "/dev/input/event4" //это исключительно для моей ВМ
 #endif
 
 int mouse_open(mouse_t* m, const char* dev) {
