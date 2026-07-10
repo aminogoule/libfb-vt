@@ -39,8 +39,29 @@
   не зависящий от бэкенда (линкуется с `-lutil`).
 - `cube    [vt]`            — демо: вращающийся сплошь затенённый 3D-куб в окне 320x200
   (тот же скелет сервера; программный рендерер, работает на любом бэкенде). Требует `-lm`.
+- `glcube  [vt]`            — тот же куб, но нарисован через `mgl` (см. ниже) — реальными
+  `mgl_begin/mgl_vertex3f/mgl_rotate/...` вместо ручной тригонометрии. Требует `-lm`.
 
 `[vt]` — это номер VT с отсчётом от 1 (7 == ttyv6); опустите или укажите 0, чтобы автоматически выбрать первый свободный VT.
+
+## mgl — программный (software) OpenGL-подобный слой
+
+`mgl.c` / `mgl.h` — маленькая **программная** реализация подмножества OpenGL 1.x в
+immediate-mode стиле (`glBegin/glVertex3f/glColor3f/glEnd`, стек матриц
+`MODELVIEW`/`PROJECTION`, `mgl_translate/rotate/scale/perspective/ortho`), растеризующая
+прямо в буфер `fb_drawbuf()` — тот же буфер, в который рисует любой другой клиент
+libfb-vt. Никакого GPU/DRM/KMS/vmwgfx: чистый CPU-рендер с Z-буфером и Gouraud-закраской
+по треугольнику (без perspective-correct интерполяции, без текстур, без `GL_LIGHTING` —
+цвет каждой вершины задаётся приложением через `mgl_color3f`, как во `glcube.c`).
+
+Это **первый шаг** — «программный GL», достаточный, чтобы существующий и новый софт мог
+рисовать через привычный API матриц/вершин. Настоящее аппаратное ускорение через
+SVGA3D-протокол VMware (guest-backed surfaces, command buffer, шейдеры) — отдельная,
+существенно большая задача, запланированная на будущее (отдельная ветка/сессия), не
+входит в этот шаг.
+
+Собирается вместе с бэкендом (`glcube.svga`/`.vga`/`.fb`), т.к. это просто исходник,
+слинкованный в бинарник клиента — отдельного `libmgl` пока нет.
 
 ## Сборка
 
@@ -323,6 +344,11 @@ Only `<sys/fbio.h>`, `<sys/consio.h>`, `<sys/kbio.h>`.
 - `server  image.ppm [vt]`  — display-server seed: exclusive VT ownership + render loop.
 - `cube    [vt]`            — demo: a spinning solid-shaded 3D cube in a 320x200 window
   (same server skeleton; software renderer, works on every backend). Needs `-lm`.
+- `glcube  [vt]`            — same cube, driven through `mgl.c`/`mgl.h`, a small **software**
+  OpenGL-1.x-style immediate-mode layer (`glBegin/glVertex3f/glColor3f`, a real
+  MODELVIEW/PROJECTION matrix stack, a Z-buffered Gouraud rasterizer) that draws straight
+  into the same `fb_drawbuf()` buffer any other client uses. Pure CPU, no GPU/DRM/KMS/vmwgfx
+  — real SVGA3D hardware acceleration is a separate, larger effort planned for later. Needs `-lm`.
 
 `[vt]` is a 1-based VT number (7 == ttyv6); omit or 0 to auto-pick the first free VT.
 
