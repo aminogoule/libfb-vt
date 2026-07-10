@@ -17,11 +17,14 @@
  * downward).
  *
  * At level 1 a 6th-8th byte is appended (MOUSE_SYS_PACKETSIZE == 8):
- *   byte 5 : dz (wheel), signed. [VERIFY] exact scaling/sign against a real
- *            device -- we pass it through as-is, which matches every sysmouse
- *            consumer's convention we could find, but hasn't been tested on
- *            real FreeBSD hardware from this checkout.
- *   bytes 6-7: extended button state -- not decoded here (see mouse.h).
+ *   byte 5, 6 : wheel. NOT a clean signed delta on this hardware/driver --
+ *            confirmed via $MOUSE_DEBUG raw-packet traces: scroll up sends
+ *            {byte5=0x7f, byte6=0x00} (byte5 saturates at INT8_MAX rather
+ *            than a small delta), scroll down sends {byte5=0x00,
+ *            byte6=0x01} (direction carried by byte6 instead). We take
+ *            sign(byte5 - byte6) and treat every completed packet as one
+ *            "click" (+-1) rather than trusting the magnitude.
+ *   byte 7    : extended button state -- not decoded here (see mouse.h).
  */
 
 #include "mouse.h"
@@ -87,8 +90,13 @@ static int apply_packet(mouse_t* m) {
 
 	dx = (int8_t)m->pkt[1] + (int8_t)m->pkt[3];
 	dy = (int8_t)m->pkt[2] + (int8_t)m->pkt[4];
-	if (m->pktlen >= MOUSE_SYS_PACKETSIZE)
-		dz = (int8_t)m->pkt[5];
+	if (m->pktlen >= MOUSE_SYS_PACKETSIZE) {
+		/* see the mouse.c header comment: this hardware doesn't give a
+		   clean small signed delta, just saturates one of two bytes
+		   depending on direction -- normalise to one "click" (+-1) */
+		int zraw = (int8_t)m->pkt[5] - (int8_t)m->pkt[6];
+		dz = (zraw > 0) - (zraw < 0);
+	}
 	m->dz += dz;
 
 	/* MOUSE_SYS_BUTTON*UP and MOUSE_MSC_BUTTON*UP share the same bit values
