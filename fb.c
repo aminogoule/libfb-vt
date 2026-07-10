@@ -109,3 +109,11 @@ int fb_flip(framebuffer_t* fb) {
 		       fb->back_stride);
 	return 0;
 }
+
+int fb_resize(framebuffer_t* fb, int width, int height) {
+	(void)fb; (void)width; (void)height;
+	/* vt(4) owns the mode (kern.vt.fb.default_mode / whatever KMS set up);
+	   no userland mode-set exists here, see fb.h. */
+	errno = ENOTSUP;
+	return -1;
+}

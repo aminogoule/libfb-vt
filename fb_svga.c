@@ -355,6 +355,54 @@ int fb_flip(framebuffer_t* fb) {
 	return fb_svga_update(fb, 0, 0, fb->info.fb_width, fb->info.fb_height);
 }
 
+/* Real-time mode change: SVGA II's WIDTH/HEIGHT/BITS_PER_PIXEL registers can
+   be reprogrammed at any time (same disable/set/enable idiom fb_svga_enable()
+   uses to re-assert the mode after a VT switch). VRAM and the FIFO stay
+   mapped as-is -- only the visible window (FB_OFFSET) and stride move. */
+int fb_resize(framebuffer_t* fb, int width, int height) {
+	uint32_t mw, mh, new_stride, need;
+
+	if (fb == NULL || s_iobase == 0 || s_io_fd == -1)
+		return -1;
+
+	mw = svga_read(SVGA_REG_MAX_WIDTH);
+	mh = svga_read(SVGA_REG_MAX_HEIGHT);
+	if (width  <= 0 || (uint32_t)width  > mw) width  = (int)mw;
+	if (height <= 0 || (uint32_t)height > mh) height = (int)mh;
+
+	svga_write(SVGA_REG_ENABLE, 0);
+	svga_write(SVGA_REG_WIDTH,          (uint32_t)width);
+	svga_write(SVGA_REG_HEIGHT,         (uint32_t)height);
+	svga_write(SVGA_REG_BITS_PER_PIXEL, (uint32_t)fb->info.fb_depth);
+	svga_write(SVGA_REG_ENABLE, 1);
+
+	new_stride = svga_read(SVGA_REG_BYTES_PER_LINE);
+	need       = new_stride * (uint32_t)height;
+	s_fb_offset = svga_read(SVGA_REG_FB_OFFSET);
+	if (need == 0 || (size_t)s_fb_offset + need > s_vram_len) {
+		errno = ENXIO;              /* device handed back a bogus geometry */
+		return -1;
+	}
+
+	fb->info.fb_width  = width;
+	fb->info.fb_height = height;
+	fb->stride          = new_stride;
+	fb->back_stride     = (size_t)width * (size_t)fb->bytes_pp;
+	fb->info.fb_size    = (int)need;
+	fb->vram            = (uint8_t*)s_vram + s_fb_offset;
+
+	if (fb->back != NULL) {
+		void* nb = realloc(fb->back, fb->back_stride * (size_t)height);
+		if (nb == NULL)
+			return -1;           /* geometry already committed; caller must
+			                        stop drawing rather than trust fb->back */
+		fb->back = nb;
+	}
+
+	memset(fb->vram, 0, (size_t)need);   /* new area may hold stale VRAM bytes */
+	return 0;
+}
+
 /* ------------------------------------------------------------------ *
  * fbsvga.h: present + enable + hardware 2D.                          *
  * ------------------------------------------------------------------ */

@@ -70,6 +70,40 @@
 #define TITLEBAR2 0x54606Fu      /* unfocused title bar (grey)           */
 #define TITLETX   0xFFFFFFu      /* title text                           */
 
+/* Popup menus: the per-window titlebar system-menu (LKM on its corner
+   button) and the desktop/window context menu (RMB anywhere). Both are one
+   generic dropdown -- a small item-label/action list plus a target surface
+   id (0 == desktop, no surface) -- rendered and hit-tested the same way. */
+#define BTN_SIZE      14         /* system-menu button square, in TITLE   */
+#define BTN_MARGIN     3         /* gap from the frame edge               */
+#define MENU_W       190         /* fits "Resolution: 1920x1080" + margin */
+#define MENU_ITEM_H   18
+#define MENU_MAXITEMS  5
+#define MENU_BG      0xEEEEF2u
+#define MENU_BORDER  0x8890A0u
+#define MENU_TX      0x101820u
+
+enum { MENU_ACT_CLOSE, MENU_ACT_TOBACK, MENU_ACT_NEW_TERM,
+       MENU_ACT_EDITOR, MENU_ACT_NEW_ITEM, MENU_ACT_RESOLUTION };
+
+/* Standard VGA/SVGA + a few WXGA resolutions, offered as a submenu off the
+   desktop menu's "Resolution" item (see open_resolution_submenu()). Only
+   takes effect on a backend whose fb_resize() actually works (fb_svga.c for
+   now; vt_fb/legacy VGA silently no-op, see fb.h). */
+static const struct { const char* label; int w, h; } RES_PRESET[] = {
+	{ "640x480 (VGA)",       640,  480  },
+	{ "800x600 (SVGA)",      800,  600  },
+	{ "1024x768 (XGA)",      1024, 768  },
+	{ "1152x864 (XGA+)",     1152, 864  },
+	{ "1280x1024 (SXGA)",    1280, 1024 },
+	{ "1280x800 (WXGA)",     1280, 800  },
+	{ "1366x768 (WXGA HD)",  1366, 768  },
+	{ "1440x900 (WXGA+)",    1440, 900  },
+	{ "1680x1050 (WSXGA+)",  1680, 1050 },
+	{ "1920x1080 (FHD)",     1920, 1080 },
+};
+#define N_RES_PRESET (int)(sizeof(RES_PRESET) / sizeof(RES_PRESET[0]))
+
 /* ------------------------------------------------------------------ *
  * A surface == one client window. The array order IS the z-order:     *
  * index 0 is the bottom window, the last is the top (focused) one.    *
@@ -101,6 +135,33 @@ static int       s_mouse_ok  = 0;
 static int       s_drag_idx  = -1;   /* index into s_surf being dragged, or -1 */
 static int       s_drag_off_x, s_drag_off_y;  /* mouse offset from surface origin */
 
+/* Popup menu (system menu or desktop/window context menu): opened by a
+   click, closed by any subsequent click (on an item, or anywhere else to
+   dismiss). Tracked by surface id rather than index since z-order can
+   change while it's open; 0 means "no surface" (desktop, or the system
+   menu's owner -- there's always exactly one owner for that kind). */
+static int       s_menu_open    = 0;
+static uint32_t  s_menu_surf_id = 0;
+static int       s_menu_x, s_menu_y;
+static int          s_menu_nitems;
+static const char*  s_menu_label[MENU_MAXITEMS];
+static int          s_menu_act[MENU_MAXITEMS];
+
+/* The one-level-deep flyout off the desktop menu's "Resolution" item: same
+   rendering/hit-test shape as the top menu, but its items are resolutions
+   (from RES_PRESET) rather than generic actions -- simpler than threading a
+   second generic action set through for a single-purpose submenu. */
+static int          s_submenu_open;
+static int          s_submenu_x, s_submenu_y;
+static int          s_submenu_nitems;
+static const char*  s_submenu_label[N_RES_PRESET];
+static int          s_submenu_w[N_RES_PRESET], s_submenu_h[N_RES_PRESET];
+
+/* Set by the resolution submenu; applied in main()'s loop (fb_resize()
+   needs the framebuffer_t*, which only main() has in scope). */
+static int       s_resize_req = 0;
+static int       s_resize_w, s_resize_h;
+
 /* raw-scancode keyboard decoding (opt-in via -k, see kbd.h). Off by default
    -- K_XLATE already handles plain typing/arrows/F-keys correctly; K_CODE is
    only needed to recover modifier state (Shift+Arrow etc.) that K_XLATE's
@@ -108,6 +169,7 @@ static int       s_drag_off_x, s_drag_off_y;  /* mouse offset from surface origi
 static int       s_kbd_raw   = 0;
 static kbd_t     s_kbd;
 static int       s_kbd_debug = 0;   /* $KBD_DEBUG: trace scancodes to stderr */
+static int       s_mouse_debug = 0; /* $MOUSE_DEBUG: trace dx/dy/dz/buttons  */
 
 /* screen draw state (mirrors cube.c's tiny primitive layer) */
 static int      g_w, g_h;
@@ -226,6 +288,92 @@ static void surface_chrome_rect(const surface_t* s,
 	*oh = s->h + 2 * FRAME + TITLE;
 }
 
+/* Top-left corner of the system-menu button, in screen coords. */
+static void titlebar_btn_rect(const surface_t* s, int* bx, int* by) {
+	int ox, oy, ow, oh;
+	surface_chrome_rect(s, &ox, &oy, &ow, &oh);
+	*bx = ox + ow - FRAME - BTN_MARGIN - BTN_SIZE;
+	*by = oy + (TITLE - BTN_SIZE) / 2;
+}
+
+static int titlebar_btn_hit(const surface_t* s, int mx, int my) {
+	int bx, by;
+	titlebar_btn_rect(s, &bx, &by);
+	return mx >= bx && mx < bx + BTN_SIZE && my >= by && my < by + BTN_SIZE;
+}
+
+/* defined near main(): forks `cmd` via /bin/sh -c as a new client */
+static void spawn_client(const char* cmd);
+
+/* Open the per-window system menu, anchored under its titlebar button. */
+static void open_sys_menu(surface_t* s) {
+	int bx, by;
+	titlebar_btn_rect(s, &bx, &by);
+	s_menu_surf_id  = s->id;
+	s_menu_nitems   = 0;
+	s_submenu_open  = 0;
+	s_menu_label[s_menu_nitems] = "Close";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_CLOSE;
+	s_menu_label[s_menu_nitems] = "Send to back";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_TOBACK;
+	s_menu_x = bx + BTN_SIZE - MENU_W;
+	if (s_menu_x < 0) s_menu_x = 0;
+	s_menu_y = by + BTN_SIZE + 2;
+	s_menu_open = 1;
+}
+
+/* Open the desktop/window context menu (RMB) at the pointer. hit_idx is the
+   surface under the pointer (surface_at()'s result), or -1 for bare desktop
+   -- "Close" only appears when a window was actually hit. */
+static void open_desktop_menu(int mx, int my, int hit_idx) {
+	s_menu_surf_id = (hit_idx >= 0) ? s_surf[hit_idx].id : 0;
+	s_menu_nitems  = 0;
+	s_submenu_open = 0;
+	s_menu_label[s_menu_nitems] = "New terminal";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_NEW_TERM;
+	if (hit_idx >= 0) {
+		s_menu_label[s_menu_nitems] = "Close";
+		s_menu_act[s_menu_nitems++] = MENU_ACT_CLOSE;
+	}
+	s_menu_label[s_menu_nitems] = "Open editor (vim)";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_EDITOR;
+	s_menu_label[s_menu_nitems] = "New item";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_NEW_ITEM;
+	s_menu_label[s_menu_nitems] = "Resolution >";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_RESOLUTION;
+
+	s_menu_x = mx;
+	s_menu_y = my;
+	if (s_menu_x + MENU_W > g_w) s_menu_x = g_w - MENU_W;
+	if (s_menu_y + s_menu_nitems * MENU_ITEM_H > g_h)
+		s_menu_y = g_h - s_menu_nitems * MENU_ITEM_H;
+	if (s_menu_x < 0) s_menu_x = 0;
+	if (s_menu_y < 0) s_menu_y = 0;
+	s_menu_open = 1;
+}
+
+/* Open the resolution flyout, normally just to the right of the parent
+   menu (parent_x = the parent menu's own left edge, row_y = the "Resolution"
+   row's y), flipped to the parent's left if it wouldn't fit on screen.
+   Does NOT close the parent menu; both stay open together. */
+static void open_resolution_submenu(int parent_x, int row_y) {
+	int i;
+	s_submenu_nitems = N_RES_PRESET;
+	for (i = 0; i < N_RES_PRESET; i++) {
+		s_submenu_label[i] = RES_PRESET[i].label;
+		s_submenu_w[i]     = RES_PRESET[i].w;
+		s_submenu_h[i]     = RES_PRESET[i].h;
+	}
+	s_submenu_x = parent_x + MENU_W;
+	if (s_submenu_x + MENU_W > g_w) s_submenu_x = parent_x - MENU_W;
+	if (s_submenu_x < 0) s_submenu_x = 0;
+	s_submenu_y = row_y;
+	if (s_submenu_y + s_submenu_nitems * MENU_ITEM_H > g_h)
+		s_submenu_y = g_h - s_submenu_nitems * MENU_ITEM_H;
+	if (s_submenu_y < 0) s_submenu_y = 0;
+	s_submenu_open = 1;
+}
+
 /* Simple 12x16 arrow pointer, drawn with a 1px black outline so it stays
    visible over any background, white fill. Hotspot is the top-left pixel. */
 static void draw_cursor(int mx, int my) {
@@ -249,6 +397,21 @@ static void draw_cursor(int mx, int my) {
 		for (col = 0; col < 12; col++)
 			if (rows[row] & (0x8000 >> col))
 				put_px(mx + col, my + row, 0xFFFFFF);
+}
+
+/* Draw one dropdown box (the top-level menu or the resolution flyout):
+   background, 1px border, then each item's label. Shared by both so they
+   never look inconsistent with each other. */
+static void draw_menu_box(int x, int y, int nitems, const char* const* label) {
+	int i, h = nitems * MENU_ITEM_H;
+	fill_rect(x, y, MENU_W, h, MENU_BG);
+	fill_rect(x, y, MENU_W, 1, MENU_BORDER);
+	fill_rect(x, y + h - 1, MENU_W, 1, MENU_BORDER);
+	fill_rect(x, y, 1, h, MENU_BORDER);
+	fill_rect(x + MENU_W - 1, y, 1, h, MENU_BORDER);
+	for (i = 0; i < nitems; i++)
+		draw_string(x + 8, y + i * MENU_ITEM_H + (MENU_ITEM_H - GLYPH_H) / 2,
+		            label[i], MENU_TX);
 }
 
 /* Composite the whole scene: desktop, then every surface bottom-to-top with
@@ -275,7 +438,28 @@ static void composite(void) {
 		if (s->title[0])
 			draw_string(ox + 6, oy + (TITLE - GLYPH_H) / 2,
 			            s->title, TITLETX);
+		{                                       /* system-menu button icon */
+			int bx, by, ly;
+			titlebar_btn_rect(s, &bx, &by);
+			for (ly = 0; ly < 3; ly++)
+				fill_rect(bx + 2, by + 2 + ly * 5, BTN_SIZE - 4, 2, TITLETX);
+		}
 		blit_surface(s);                                         /* pixels   */
+	}
+
+	if (s_menu_open) {
+		int i, found = (s_menu_surf_id == 0);   /* 0 == desktop, always valid */
+		for (i = 0; !found && i < s_nsurf; i++)
+			if (s_surf[i].id == s_menu_surf_id) found = 1;
+		if (!found) {
+			s_menu_open    = 0;       /* its surface closed itself meanwhile */
+			s_submenu_open = 0;
+		} else {
+			draw_menu_box(s_menu_x, s_menu_y, s_menu_nitems, s_menu_label);
+			if (s_submenu_open)
+				draw_menu_box(s_submenu_x, s_submenu_y, s_submenu_nitems,
+				              s_submenu_label);
+		}
 	}
 
 	if (s_mouse_ok)
@@ -427,6 +611,26 @@ static void route_key(int byte) {
 	(void)fbvt_send(s->fd, &m, NULL);    /* a dead client is reaped on recv */
 }
 
+/* Forward a whole keypress's worth of bytes (e.g. a decoded CSI escape
+   sequence from kbd_feed()) to the focused surface in one message, so the
+   client's parser sees them with no gap a poll timeout could land in. */
+static void route_keyseq(const unsigned char* buf, int n) {
+	surface_t*      s;
+	struct fbvt_msg m;
+
+	if (s_nsurf == 0 || n <= 0)
+		return;
+	s = &s_surf[s_nsurf - 1];            /* focused == topmost */
+	if (s->id == 0)
+		return;
+
+	memset(&m, 0, sizeof(m));
+	m.type   = FBVT_INPUT_KEYSEQ;
+	m.id     = s->id;
+	m.paylen = (uint32_t)n;
+	(void)fbvt_send(s->fd, &m, buf);     /* a dead client is reaped on recv */
+}
+
 /* Topmost surface (by chrome rect, frame+titlebar+content) under (mx,my), or
    -1. *titlebar is set to 1 when the hit was within the titlebar strip. */
 static int surface_at(int mx, int my, int* titlebar) {
@@ -455,6 +659,26 @@ static void surface_raise(int i) {
 	memmove(&s_surf[i], &s_surf[i + 1],
 	        (size_t)(s_nsurf - i - 1) * sizeof(s_surf[0]));
 	s_surf[s_nsurf - 1] = tmp;
+}
+
+/* Move surface i to the bottom of the z-order ("send to back"). */
+static void surface_lower(int i) {
+	surface_t tmp;
+	if (i <= 0)
+		return;
+	tmp = s_surf[i];
+	memmove(&s_surf[1], &s_surf[0], (size_t)i * sizeof(s_surf[0]));
+	s_surf[0] = tmp;
+}
+
+/* Politely ask a surface's client to go away (see FBVT_CLOSE); the client
+   closes its socket in response and the usual poll/EOF path reaps it. */
+static void surface_request_close(surface_t* s) {
+	struct fbvt_msg m;
+	memset(&m, 0, sizeof(m));
+	m.type = FBVT_CLOSE;
+	m.id   = s->id;
+	(void)fbvt_send(s->fd, &m, NULL);
 }
 
 /* Forward one pointer event to the focused (topmost) surface. (rx,ry) are
@@ -487,20 +711,99 @@ static int handle_mouse(int prev_buttons) {
 	int dirty   = 1;                     /* the cursor itself always moved */
 
 	if (pressed & MOUSE_BTN_LEFT) {
-		int titlebar = 0;
-		int hit = surface_at(s_mouse.x, s_mouse.y, &titlebar);
-		if (hit >= 0) {
-			surface_raise(hit);
-			if (titlebar) {
-				surface_t* s = &s_surf[s_nsurf - 1];
-				s_drag_idx   = s_nsurf - 1;
-				s_drag_off_x = s_mouse.x - s->x;
-				s_drag_off_y = s_mouse.y - s->y;
+		int consumed = 0;
+
+		/* the resolution flyout, if open, gets first say: a hit picks a
+		   resolution and closes both menus, a miss falls through to the
+		   parent menu below (so clicking elsewhere in the parent, or
+		   dismissing entirely, still works in one click) */
+		if (s_submenu_open) {
+			int smh = s_submenu_nitems * MENU_ITEM_H;
+			if (s_mouse.x >= s_submenu_x && s_mouse.x < s_submenu_x + MENU_W &&
+			    s_mouse.y >= s_submenu_y && s_mouse.y < s_submenu_y + smh) {
+				int sitem = (s_mouse.y - s_submenu_y) / MENU_ITEM_H;
+				if (sitem >= 0 && sitem < s_submenu_nitems) {
+					s_resize_w   = s_submenu_w[sitem];
+					s_resize_h   = s_submenu_h[sitem];
+					s_resize_req = 1;
+				}
+				s_menu_open    = 0;
+				s_submenu_open = 0;
+				consumed = 1;
+			}
+		}
+
+		/* an open menu eats the next left click: either it hit an item (act
+		   on it) or it didn't (just dismiss, then fall through to ordinary
+		   click handling below for whatever's under the pointer) */
+		if (!consumed && s_menu_open) {
+			int mh = s_menu_nitems * MENU_ITEM_H;
+			s_menu_open    = 0;
+			s_submenu_open = 0;
+			if (s_mouse.x >= s_menu_x && s_mouse.x < s_menu_x + MENU_W &&
+			    s_mouse.y >= s_menu_y && s_mouse.y < s_menu_y + mh) {
+				int item = (s_mouse.y - s_menu_y) / MENU_ITEM_H;
+				if (item >= 0 && item < s_menu_nitems) {
+					int act = s_menu_act[item];
+					int i, idx = -1;
+					if (s_menu_surf_id != 0)
+						for (i = 0; i < s_nsurf; i++)
+							if (s_surf[i].id == s_menu_surf_id) { idx = i; break; }
+					switch (act) {
+					case MENU_ACT_CLOSE:
+						if (idx >= 0) surface_request_close(&s_surf[idx]);
+						break;
+					case MENU_ACT_TOBACK:
+						if (idx >= 0) surface_lower(idx);
+						break;
+					case MENU_ACT_NEW_TERM:
+						spawn_client("./term");
+						break;
+					case MENU_ACT_EDITOR:
+						spawn_client("TERM_CMD=vim ./term");
+						break;
+					case MENU_ACT_RESOLUTION:
+						/* re-open: a flyout, not an action -- keep the
+						   parent menu up so both render together */
+						open_resolution_submenu(s_menu_x,
+						                         s_menu_y + item * MENU_ITEM_H);
+						s_menu_open = 1;
+						break;
+					case MENU_ACT_NEW_ITEM:
+					default:
+						break;          /* placeholder, intentionally no-op */
+					}
+				}
+				consumed = 1;
+			}
+		}
+
+		if (!consumed) {
+			int titlebar = 0;
+			int hit = surface_at(s_mouse.x, s_mouse.y, &titlebar);
+			if (hit >= 0) {
+				surface_raise(hit);
+				if (titlebar) {
+					surface_t* s = &s_surf[s_nsurf - 1];
+					if (titlebar_btn_hit(s, s_mouse.x, s_mouse.y)) {
+						open_sys_menu(s);
+					} else {
+						s_drag_idx   = s_nsurf - 1;
+						s_drag_off_x = s_mouse.x - s->x;
+						s_drag_off_y = s_mouse.y - s->y;
+					}
+				}
 			}
 		}
 	}
 	if (!(s_mouse.buttons & MOUSE_BTN_LEFT))
 		s_drag_idx = -1;
+
+	if (pressed & MOUSE_BTN_RIGHT) {
+		int titlebar = 0;      /* unused here, but surface_at() needs it */
+		int hit = surface_at(s_mouse.x, s_mouse.y, &titlebar);
+		open_desktop_menu(s_mouse.x, s_mouse.y, hit);
+	}
 
 	if (s_drag_idx >= 0) {
 		surface_t* s = &s_surf[s_drag_idx];
@@ -524,6 +827,42 @@ static int handle_mouse(int prev_buttons) {
 	}
 
 	return dirty;
+}
+
+/* Apply a pending MENU_ACT_RESOLUTION request (see s_resize_req). Only
+   works on a backend whose fb_resize() is real (fb_svga.c); on vt_fb/legacy
+   VGA it just fails and we say so once to stderr. On success, every piece
+   of state sized off the old g_w/g_h gets re-derived: the mouse clamp
+   bounds, every window's on-screen position, and a full repaint. */
+static void apply_resize(framebuffer_t* fb) {
+	int i;
+
+	if (fb_resize(fb, s_resize_w, s_resize_h) != 0) {
+		fprintf(stderr, "server: fb_resize(%dx%d): %s (backend doesn't "
+		        "support real-time mode changes)\n",
+		        s_resize_w, s_resize_h, strerror(errno));
+		return;
+	}
+
+	g_w = fb->info.fb_width;
+	g_h = fb->info.fb_height;
+
+	if (s_mouse_ok) {
+		mouse_set_bounds(&s_mouse, g_w - 1, g_h - 1);
+		if (s_mouse.x > g_w - 1) s_mouse.x = g_w - 1;
+		if (s_mouse.y > g_h - 1) s_mouse.y = g_h - 1;
+	}
+
+	for (i = 0; i < s_nsurf; i++) {
+		surface_t* s = &s_surf[i];
+		if (s->x + s->w + FRAME > g_w) s->x = g_w - FRAME - s->w;
+		if (s->y + s->h + FRAME > g_h) s->y = g_h - FRAME - s->h;
+		if (s->x < FRAME)        s->x = FRAME;
+		if (s->y < FRAME + TITLE) s->y = FRAME + TITLE;
+	}
+
+	s_menu_open    = 0;   /* its screen coords may no longer make sense */
+	s_submenu_open = 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -586,6 +925,8 @@ int main(int argc, char* argv[]) {
 			vtnum = atoi(argv[argi]);
 	}
 	s_kbd_debug = (getenv("KBD_DEBUG") != NULL);
+	s_mouse_debug = (getenv("MOUSE_DEBUG") != NULL);
+	mouse_debug   = s_mouse_debug;
 
 	signal(SIGPIPE, SIG_IGN);            /* dead-client writes => EPIPE  */
 	signal(SIGCHLD, SIG_IGN);            /* auto-reap spawned clients    */
@@ -689,12 +1030,11 @@ int main(int argc, char* argv[]) {
 				while ((key = vtcon_get_scancode(&con)) != -1) {
 					unsigned char kbuf[8];
 					int           n = kbd_feed(&s_kbd, key, kbuf);
-					int           j;
 					if (s_kbd_debug)
 						fprintf(stderr, "sc 0x%02x -> %d byte%s\n",
 						        key, n, n == 1 ? "" : "s");
-					for (j = 0; j < n; j++)
-						route_key(kbuf[j]);
+					if (n > 0)
+						route_keyseq(kbuf, n);
 				}
 			} else {
 				while ((key = vtcon_getkey(&con)) != -1)
@@ -710,9 +1050,18 @@ int main(int argc, char* argv[]) {
 				mouse_close(&s_mouse);
 				s_mouse_ok = 0;
 			} else if (r > 0) {
+				if (s_mouse_debug && s_mouse.dz != 0)
+					fprintf(stderr, "mouse dz=%d buttons=0x%x\n",
+					        s_mouse.dz, s_mouse.buttons);
 				if (handle_mouse(prev_buttons))
 					dirty = 1;
 			}
+		}
+
+		if (s_resize_req) {
+			s_resize_req = 0;
+			apply_resize(fb);
+			dirty = 1;
 		}
 
 		/* new client connections */

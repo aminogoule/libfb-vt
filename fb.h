@@ -60,4 +60,19 @@ size_t fb_pitch(framebuffer_t* fb);
 /* Copy the back buffer to the screen. No-op when single buffered. */
 int fb_flip(framebuffer_t* fb);
 
+/*
+ * Attempt a real-time mode change to width x height (same bpp/backend as
+ * fb_open() picked). On success (0), fb->info/stride/back_stride/map_size/
+ * vram/back are all updated in place -- the caller must re-fetch
+ * fb_drawbuf()/fb_pitch() afterwards and treat this like a fresh fb_open()
+ * as far as geometry goes (reposition anything clamped to the old size).
+ *
+ * Only fb_svga.c can actually do this: VMware SVGA II is the one backend
+ * here with a real mode-set register interface. fb.c (vt_fb/KMS) and
+ * fb_vga.c (legacy planar VGA) always fail with errno = ENOTSUP -- their
+ * mode is owned by the kernel or wired to one fixed VGA mode, not something
+ * userland can renegotiate (see the fb.h and fb_vga.c header comments).
+ */
+int fb_resize(framebuffer_t* fb, int width, int height);
+
 #endif /* FB_H */

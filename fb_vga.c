@@ -270,3 +270,11 @@ int fb_flip(framebuffer_t* fb) {
 	}
 	return 0;
 }
+
+int fb_resize(framebuffer_t* fb, int width, int height) {
+	(void)fb; (void)width; (void)height;
+	/* fixed at mode 0x12 (640x480x16), see the file header -- no other mode
+	   exists for this backend to switch to. */
+	errno = ENOTSUP;
+	return -1;
+}

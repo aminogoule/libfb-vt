@@ -57,4 +57,10 @@ int mouse_poll(mouse_t* m);
 
 void mouse_close(mouse_t* m);
 
+/* Set (e.g. from $MOUSE_DEBUG) to trace every decoded packet's raw bytes to
+   stderr, even ones apply_packet() judges "unchanged" -- needed to see what
+   a wheel click actually sends when it doesn't move dz the way we expect
+   (the sign/scale of dz is unverified on real hardware, see mouse.c). */
+extern int mouse_debug;
+
 #endif /* MOUSE_H */

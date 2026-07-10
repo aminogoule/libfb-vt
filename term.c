@@ -115,6 +115,17 @@ typedef struct {
 	int       scroll_top, scroll_bot;  /* DECSTBM margins, 0-based inclusive */
 	int       app_cursor_keys;         /* DECCKM: 1 => arrows report ESC O x */
 
+	/* scrollback: lines pushed off the top of the primary screen (see
+	   region_scroll_up), viewable with the mouse wheel when the foreground
+	   app hasn't grabbed the mouse itself (mouse_mode == 0) -- e.g. `cat` of
+	   a file too long to fit on screen at a plain shell prompt. A ring
+	   buffer of SB_LINES rows; scroll_offset is how many lines back from
+	   the live bottom the view currently is (0 == live). */
+	cell_t*   sb_buf;
+	int       sb_head;                 /* index of the oldest stored line */
+	int       sb_count;                /* lines stored, <= SB_LINES       */
+	int       scroll_offset;
+
 	/* xterm-style mouse reporting (DECSET 1000/1002/1006) */
 	int       mouse_mode;     /* 0 = off, 1000 = click, 1002 = click+drag */
 	int       mouse_sgr;      /* 1 => SGR (1006) coordinate encoding      */
@@ -148,6 +159,8 @@ typedef struct {
 enum { S_NORM, S_ESC, S_CSI, S_OSC, S_OSC_ESC, S_CHARSET };
 enum { KIN_NORM, KIN_ESC, KIN_CSI };
 
+#define SB_LINES 2000   /* mouse-wheel scrollback depth, primary screen only */
+
 /* set from $TERM_DEBUG at startup; traces executed CSI sequences to stderr
    so scroll/margin issues in real apps (vim, mc) can be diagnosed without
    guessing. */
@@ -172,6 +185,21 @@ static void grid_clear(term_t* t) {
    below param(); needed by the scroll helpers. */
 static void erase_span(term_t* t, int from, int to);
 
+/* Append one row (t->cols cells) to the scrollback ring, overwriting the
+   oldest row once full. */
+static void sb_push_line(term_t* t, int row) {
+	int idx;
+	if (t->sb_count < SB_LINES) {
+		idx = (t->sb_head + t->sb_count) % SB_LINES;
+		t->sb_count++;
+	} else {
+		idx = t->sb_head;
+		t->sb_head = (t->sb_head + 1) % SB_LINES;
+	}
+	memcpy(&t->sb_buf[idx * t->cols], &t->grid[row * t->cols],
+	       (size_t)t->cols * sizeof(cell_t));
+}
+
 /* Scroll rows [top,bot] (0-based, inclusive) of the grid up/down by n lines,
    pulling in blank lines at the vacated edge. This is the primitive behind
    LF/RI at the scroll margins and the DECSTBM-aware CSI L/M/S/T sequences --
@@ -183,6 +211,12 @@ static void region_scroll_up(term_t* t, int top, int bot, int n) {
 	int i;
 	if (n <= 0 || span <= 0) return;
 	if (n > span) n = span;
+	/* only the plain "scroll the whole primary screen" case is real output
+	   history -- a DECSTBM-restricted region or the alt screen (vim/mc, which
+	   manage their own display) isn't */
+	if (top == 0 && !t->alt_active)
+		for (i = 0; i < n; i++)
+			sb_push_line(t, top + i);
 	if (n < span)
 		memmove(&t->grid[top * t->cols], &t->grid[(top + n) * t->cols],
 		        (size_t)(span - n) * t->cols * sizeof(cell_t));
@@ -311,11 +345,13 @@ static void dec_mode(term_t* t, int on) {
 				t->scroll_top = 0;
 				t->scroll_bot = t->rows - 1;
 				t->alt_active = 1;
+				t->scroll_offset = 0;   /* alt screen has no scrollback view */
 			} else if (!on && t->alt_active) {
 				t->grid = t->primary_grid;
 				t->cx = t->alt_saved_cx;
 				t->cy = t->alt_saved_cy;
 				t->alt_active = 0;
+				t->scroll_offset = 0;
 			}
 			break;
 		case 1000:
@@ -582,6 +618,15 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 	int i;
 
 	if (t->mouse_mode == 0) {
+		/* the foreground app hasn't grabbed the mouse (e.g. a plain shell
+		   prompt): use the wheel to browse scrollback instead of forwarding
+		   it anywhere. 3 lines/click matches common terminal defaults. */
+		if (dz != 0) {
+			t->scroll_offset += dz * 3;
+			if (t->scroll_offset < 0) t->scroll_offset = 0;
+			if (t->scroll_offset > t->sb_count) t->scroll_offset = t->sb_count;
+			t->dirty = 1;
+		}
 		t->mouse_buttons = buttons;
 		return;
 	}
@@ -713,6 +758,11 @@ static int kin_buf_to_int(const term_t* t) {
 }
 
 static void handle_key_byte(term_t* t, unsigned char b) {
+	/* typing snaps the view back to live output, like every other terminal */
+	if (t->scroll_offset != 0) {
+		t->scroll_offset = 0;
+		t->dirty = 1;
+	}
 	switch (t->kin_state) {
 	case KIN_NORM:
 		if (b == 0x1B) { t->kin_state = KIN_ESC; return; }
@@ -770,11 +820,21 @@ static void handle_key_byte(term_t* t, unsigned char b) {
  * ------------------------------------------------------------------ */
 static void render(term_t* t) {
 	int row, col, gy, gx;
+	int view_start = t->sb_count - t->scroll_offset;  /* first line shown */
 
 	for (row = 0; row < t->rows; row++) {
+		int     abs_line = view_start + row;
+		cell_t* line_cells;
+		if (abs_line < t->sb_count) {
+			int idx = (t->sb_head + abs_line) % SB_LINES;
+			line_cells = &t->sb_buf[idx * t->cols];
+		} else {
+			line_cells = &t->grid[(abs_line - t->sb_count) * t->cols];
+		}
 		for (col = 0; col < t->cols; col++) {
-			cell_t*  c   = &t->grid[row * t->cols + col];
-			int      cur = t->cursor_vis && row == t->cy && col == t->cx;
+			cell_t*  c   = &line_cells[col];
+			int      cur = t->scroll_offset == 0 && t->cursor_vis &&
+			               row == t->cy && col == t->cx;
 			uint32_t fg  = cur ? c->bg : c->fg;
 			uint32_t bg  = cur ? c->fg : c->bg;
 			const unsigned char* g = glyph_for(c->cp);
@@ -872,13 +932,19 @@ static int spawn_shell(term_t* t) {
 	pid = forkpty(&master, NULL, NULL, &ws);
 	if (pid < 0)
 		return -1;
-	if (pid == 0) {                       /* child: the shell */
-		const char* sh = getenv("SHELL");
-		if (sh == NULL || *sh == '\0') sh = "/bin/sh";
+	if (pid == 0) {                       /* child: the shell (or $TERM_CMD) */
+		const char* cmd = getenv("TERM_CMD");
 		setenv("TERM", "xterm-256color", 1);
 		unsetenv("LINES");
 		unsetenv("COLUMNS");
-		execl(sh, sh, "-i", (char*)NULL);
+		if (cmd != NULL && *cmd != '\0') {
+			unsetenv("TERM_CMD");
+			execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+		} else {
+			const char* sh = getenv("SHELL");
+			if (sh == NULL || *sh == '\0') sh = "/bin/sh";
+			execl(sh, sh, "-i", (char*)NULL);
+		}
 		_exit(127);
 	}
 
@@ -927,7 +993,10 @@ int main(int argc, char* argv[]) {
 
 	t.primary_grid = calloc((size_t)t.cols * t.rows, sizeof(cell_t));
 	t.alt_grid     = calloc((size_t)t.cols * t.rows, sizeof(cell_t));
-	if (t.primary_grid == NULL || t.alt_grid == NULL) { rc = EX_OSERR; goto out; }
+	t.sb_buf       = calloc((size_t)t.cols * SB_LINES, sizeof(cell_t));
+	if (t.primary_grid == NULL || t.alt_grid == NULL || t.sb_buf == NULL) {
+		rc = EX_OSERR; goto out;
+	}
 	t.grid = t.primary_grid;
 	t.scroll_top = 0;
 	t.scroll_bot = t.rows - 1;
@@ -959,12 +1028,20 @@ int main(int argc, char* argv[]) {
 		/* input keys from the compositor -> the pty */
 		if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
 			struct fbvt_msg m;
-			int             r = fbvt_recv(t.sock, &m, NULL, 0, NULL);
+			unsigned char   seqbuf[8];
+			int             r = fbvt_recv(t.sock, &m, seqbuf, sizeof(seqbuf), NULL);
 			if (r <= 0)
 				break;                     /* compositor gone */
 			if (m.type == FBVT_INPUT_KEY) {
 				unsigned char b = (unsigned char)m.arg[0];
 				handle_key_byte(&t, b);
+			} else if (m.type == FBVT_INPUT_KEYSEQ) {
+				/* all bytes of one keypress, fed with no poll gap between
+				   them so a scheduling delay can't split a CSI sequence
+				   and desync the parser (see kin_flush_pending) */
+				uint32_t i;
+				for (i = 0; i < m.paylen && i < sizeof(seqbuf); i++)
+					handle_key_byte(&t, seqbuf[i]);
 			} else if (m.type == FBVT_INPUT_MOUSE) {
 				handle_mouse_msg(&t, &m);
 			} else if (m.type == FBVT_CLOSE) {
@@ -1008,5 +1085,6 @@ out:
 	if (t.sock >= 0) close(t.sock);
 	free(t.primary_grid);
 	free(t.alt_grid);
+	free(t.sb_buf);
 	return rc;
 }
