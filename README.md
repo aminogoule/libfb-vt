@@ -210,43 +210,54 @@ xterm (нет модификаторов клавиш, bracketed paste и т.п.
 
 ---
 
-## Бэкенды (добавлено): vt_fb / vt_vga / VMware SVGA II
+## Бэкенды (добавлено): vt_fb / vt_vga / VMware SVGA II / SVGA3
 
-Слой framebuffer теперь имеет три взаимозаменяемых бэкенда за одним и тем же
-API `fb.h`. Выбирайте по одному на бинарник; Makefile собирает все три с суффиксами:
+Слой framebuffer теперь имеет четыре взаимозаменяемых бэкенда за одним и тем же
+API `fb.h`. Выбирайте по одному на бинарник; Makefile собирает все с суффиксами:
 
-| Бэкенд     | Исходник    | Консоль / железо       | Путь к пикселям                         |
-|------------|-------------|------------------------|-----------------------------------------|
-| `.fb`      | `fb.c`      | vt_fb / scfb / KMS (vtfb0) | `FBIOGTYPE` + `mmap` с tty          |
-| `.vga`     | `fb_vga.c`  | vt_vga (vtvga0)        | `/dev/mem` 0xA0000 + `/dev/io` (планарный 12h) |
-| `.svga`    | `fb_svga.c` | VMware SVGA II (15ad:0405) | `/dev/pci` + `/dev/io` + `/dev/mem` (линейный + FIFO 2D) |
+| Бэкенд     | Исходник     | Консоль / железо       | Путь к пикселям                         |
+|------------|--------------|------------------------|-----------------------------------------|
+| `.fb`      | `fb.c`       | vt_fb / scfb / KMS (vtfb0) | `FBIOGTYPE` + `mmap` с tty          |
+| `.vga`     | `fb_vga.c`   | vt_vga (vtvga0)        | `/dev/mem` 0xA0000 + `/dev/io` (планарный 12h) |
+| `.svga`    | `fb_svga.c`  | VMware SVGA II (15ad:0405) | `/dev/pci` + `/dev/io` + `/dev/mem` (линейный + FIFO 2D) |
+| `.svga3`   | `fb_svga3.c` | VMware SVGA3 (15ad:0406) | `/dev/pci` + `/dev/mem` (линейный, регистры в MMIO) |
 
 Какой из них вам нужен:
 
     sysctl kern.vty                 # должно быть 'vt'
     dmesg | grep -E 'VT\(|vgapci'   # VT(vga)=vtvga0, VT(efifb)/fb=vtfb0
-    pciconf -lv | grep -i vmware    # 15ad:0405 => SVGA II присутствует
+    pciconf -lv | grep -i vmware    # 15ad:0405 => SVGA II, 15ad:0406 => SVGA3
 
 - **vtfb0** (линейная консоль уже присутствует) -> `.fb`, самый простой, без привилегий
   сверх открытия tty.
 - **vtvga0** (`VT(vga)`) -> `.vga`. Замечание: если консоль `VT(vga): text 80x25`,
   карта находится в VGA *текстовом* режиме; `fb_vga.c` предполагает, что она переведена
   в графический режим 12h. На VMware предпочтительнее путь SVGA ниже.
-- **VMware SVGA II** -> `.svga`: полноценный линейный 32bpp framebuffer любого разрешения
-  плюс аппаратный 2D (`RECT_COPY`/`RECT_FILL`, когда устройство объявляет возможности,
-  иначе программный fallback), без X, без DRM/KMS, без vmwgfx.
+- **VMware SVGA II** (`15ad:0405`) -> `.svga`: полноценный линейный 32bpp framebuffer
+  любого разрешения плюс аппаратный 2D (`RECT_COPY`/`RECT_FILL`, когда устройство
+  объявляет возможности, иначе программный fallback), без X, без DRM/KMS, без vmwgfx.
+- **VMware SVGA3** (`15ad:0406`) -> `.svga3`: поколение с регистрами в MMIO (то, что
+  VMware Fusion отдаёт гостям **arm64** / UEFI). Отличия от SVGA II, из-за которых нужен
+  отдельный бэкенд:
+  - **нет I/O-портов** — регистры отображены в BAR0 (индекс `i` = слово по смещению `i*4`),
+    поэтому `/dev/io` не нужен и бэкенд **архитектурно-независим** (собирается и на arm64);
+  - **нет легаси-FIFO** — аппаратного 2D нет (`fill`/`copy` только программные), а present
+    неявный: устройство непрерывно сканаутит VRAM, поэтому `fb_svga_update()` — no-op;
+  - BAR0 = регистры, **BAR2 = VRAM** (у SVGA II было BAR1/BAR2), базы и длины берутся
+    через `PCIOCGETBAR` (корректно и для 64-битных BAR).
 
 ### Сборка
 
-    make            # все три бэкенда
-    make svga       # только бинарники VMware SVGA II
-    sudo ./server.svga ./test.ppm
+    make            # все бэкенды
+    make svga       # только бинарники VMware SVGA II  (15ad:0405)
+    make svga3      # только бинарники VMware SVGA3     (15ad:0406)
+    sudo ./server.svga3 ./test.ppm
 
 ### Требования
 
-Все бэкенды: root, на консоли `vt(4)`. `.vga` и `.svga` дополнительно требуют
+Все бэкенды: root, на консоли `vt(4)`. `.vga`, `.svga`, `.svga3` дополнительно требуют
 `kern.securelevel <= 0` (доступный на запись `/dev/mem`). `.svga` использует `/dev/pci`,
-`/dev/io`, `/dev/mem`.
+`/dev/io`, `/dev/mem`; `.svga3` — `/dev/pci` и `/dev/mem` (без `/dev/io`).
 
 ### Переключение VT во время работы сервера
 
@@ -366,43 +377,53 @@ Quit with `q` / ESC (or SIGINT/SIGTERM). `server` refuses VT switching
 
 ---
 
-## Backends (added): vt_fb / vt_vga / VMware SVGA II
+## Backends (added): vt_fb / vt_vga / VMware SVGA II / SVGA3
 
-The framebuffer layer now has three interchangeable backends behind the same
-`fb.h` API. Pick one per binary; the Makefile builds all three, suffixed:
+The framebuffer layer now has four interchangeable backends behind the same
+`fb.h` API. Pick one per binary; the Makefile builds all of them, suffixed:
 
-| Backend    | Source      | Console / HW           | Path to pixels                          |
-|------------|-------------|------------------------|-----------------------------------------|
-| `.fb`      | `fb.c`      | vt_fb / scfb / KMS (vtfb0) | `FBIOGTYPE` + `mmap` off the tty     |
-| `.vga`     | `fb_vga.c`  | vt_vga (vtvga0)        | `/dev/mem` 0xA0000 + `/dev/io` (planar 12h) |
-| `.svga`    | `fb_svga.c` | VMware SVGA II (15ad:0405) | `/dev/pci` + `/dev/io` + `/dev/mem` (linear + FIFO 2D) |
+| Backend    | Source       | Console / HW           | Path to pixels                          |
+|------------|--------------|------------------------|-----------------------------------------|
+| `.fb`      | `fb.c`       | vt_fb / scfb / KMS (vtfb0) | `FBIOGTYPE` + `mmap` off the tty     |
+| `.vga`     | `fb_vga.c`   | vt_vga (vtvga0)        | `/dev/mem` 0xA0000 + `/dev/io` (planar 12h) |
+| `.svga`    | `fb_svga.c`  | VMware SVGA II (15ad:0405) | `/dev/pci` + `/dev/io` + `/dev/mem` (linear + FIFO 2D) |
+| `.svga3`   | `fb_svga3.c` | VMware SVGA3 (15ad:0406) | `/dev/pci` + `/dev/mem` (linear, MMIO registers) |
 
 Which one you need:
 
     sysctl kern.vty                 # must be 'vt'
     dmesg | grep -E 'VT\(|vgapci'   # VT(vga)=vtvga0, VT(efifb)/fb=vtfb0
-    pciconf -lv | grep -i vmware    # 15ad:0405 => SVGA II present
+    pciconf -lv | grep -i vmware    # 15ad:0405 => SVGA II, 15ad:0406 => SVGA3
 
 - **vtfb0** (linear console already present) -> `.fb`, simplest, no privileges
   beyond opening the tty.
 - **vtvga0** (`VT(vga)`) -> `.vga`. Note: if the console is `VT(vga): text 80x25`
   the card is in VGA *text* mode; `fb_vga.c` assumes it has been put into 12h
   graphics. On VMware, prefer the SVGA path below instead.
-- **VMware SVGA II** -> `.svga`: full linear 32bpp framebuffer at any resolution
-  plus hardware 2D (`RECT_COPY`/`RECT_FILL` when the device advertises the caps,
-  software fallback otherwise), with no X, no DRM/KMS, no vmwgfx.
+- **VMware SVGA II** (`15ad:0405`) -> `.svga`: full linear 32bpp framebuffer at
+  any resolution plus hardware 2D (`RECT_COPY`/`RECT_FILL` when the device
+  advertises the caps, software fallback otherwise), no X, no DRM/KMS, no vmwgfx.
+- **VMware SVGA3** (`15ad:0406`) -> `.svga3`: the register-MMIO generation (what
+  VMware Fusion gives **arm64** / UEFI guests). Why it needs its own backend:
+  - **no I/O ports** — registers live in BAR0 (index `i` = word at byte `i*4`), so
+    no `/dev/io` and the backend is **architecture-independent** (builds on arm64);
+  - **no legacy FIFO** — no hardware 2D (`fill`/`copy` are software) and present is
+    implicit: the device scans out VRAM continuously, so `fb_svga_update()` is a no-op;
+  - BAR0 = registers, **BAR2 = VRAM** (SVGA II used BAR1/BAR2); bases and lengths
+    come from `PCIOCGETBAR` (64-bit-BAR safe).
 
 ### Build
 
-    make            # all three backends
-    make svga       # just the VMware SVGA II binaries
-    sudo ./server.svga ./test.ppm
+    make            # all backends
+    make svga       # just the VMware SVGA II binaries  (15ad:0405)
+    make svga3      # just the VMware SVGA3 binaries     (15ad:0406)
+    sudo ./server.svga3 ./test.ppm
 
 ### Requirements
 
-All backends: root, on a `vt(4)` console. `.vga` and `.svga` additionally need
-`kern.securelevel <= 0` (writable `/dev/mem`). `.svga` uses `/dev/pci`, `/dev/io`,
-`/dev/mem`.
+All backends: root, on a `vt(4)` console. `.vga`, `.svga`, `.svga3` additionally
+need `kern.securelevel <= 0` (writable `/dev/mem`). `.svga` uses `/dev/pci`,
+`/dev/io`, `/dev/mem`; `.svga3` uses `/dev/pci` and `/dev/mem` (no `/dev/io`).
 
 ### VT switching while the server runs
 
