@@ -68,6 +68,8 @@ enum {
 	SVGA_REG_VRAM_SIZE       = 15,
 	SVGA_REG_FB_SIZE         = 16,
 	SVGA_REG_CAPABILITIES    = 17,
+	SVGA_REG_SYNC            = 21,   /* write => flush/present traced regions */
+	SVGA_REG_BUSY            = 22,   /* non-zero while the device is working  */
 	SVGA_REG_TRACES          = 45    /* auto-present VRAM writes (legacy)   */
 };
 
@@ -98,6 +100,11 @@ static void*     s_vram     = NULL;         /* mmap'd BAR2 (whole VRAM)   */
 static size_t    s_vram_len = 0;
 static uint32_t  s_fb_offset = 0;           /* visible frame offset       */
 static int       s_open     = 0;            /* device brought up          */
+
+/* register state captured at open, restored on close so the vt(4) console
+   scanout comes back (SVGA3 has no VGA text emulation to fall back to) */
+static int       s_saved    = 0;
+static uint32_t  s_save_w, s_save_h, s_save_bpp, s_save_enable;
 
 static __inline void svga_write(int reg, uint32_t val) {
 	s_regs[reg] = val;                       /* MMIO: index i @ i*4 bytes */
@@ -210,6 +217,14 @@ framebuffer_t* fb_svga_open(int width, int height, int bpp, int db) {
 	if (svga_negotiate_id() != 0) { errno = ENXIO; goto fail; }
 	s_open = 1;
 
+	/* snapshot the mode the firmware/console left in the SVGA registers, so
+	   fb_close() can hand the scanout back instead of just blanking it */
+	s_save_w      = svga_read(SVGA_REG_WIDTH);
+	s_save_h      = svga_read(SVGA_REG_HEIGHT);
+	s_save_bpp    = svga_read(SVGA_REG_BITS_PER_PIXEL);
+	s_save_enable = svga_read(SVGA_REG_ENABLE);
+	s_saved       = (s_save_w != 0 && s_save_h != 0 && s_save_enable != 0);
+
 	/* clamp requested mode to what the device allows */
 	mw = svga_read(SVGA_REG_MAX_WIDTH);
 	mh = svga_read(SVGA_REG_MAX_HEIGHT);
@@ -261,7 +276,17 @@ framebuffer_t* fb_open(const char* dev, int db) {
 
 void fb_close(framebuffer_t* fb) {
 	if (s_open) {
-		svga_write(SVGA_REG_ENABLE, SVGA_REG_ENABLE_DISABLE);  /* stop scanout */
+		if (s_saved) {
+			/* restore the console's original scanout mode and present it */
+			svga_write(SVGA_REG_ENABLE, SVGA_REG_ENABLE_DISABLE);
+			svga_write(SVGA_REG_WIDTH,          s_save_w);
+			svga_write(SVGA_REG_HEIGHT,         s_save_h);
+			svga_write(SVGA_REG_BITS_PER_PIXEL, s_save_bpp);
+			svga_write(SVGA_REG_ENABLE,         s_save_enable);
+			svga_write(SVGA_REG_SYNC, 1);
+		} else {
+			svga_write(SVGA_REG_ENABLE, SVGA_REG_ENABLE_DISABLE);  /* stop scanout */
+		}
 		s_open = 0;
 	}
 	if (s_vram && s_vram != MAP_FAILED) munmap(s_vram, s_vram_len);
@@ -283,8 +308,8 @@ size_t fb_pitch(framebuffer_t* fb) {
 	return fb->back ? fb->back_stride : fb->stride;
 }
 
-/* fb_flip: if double-buffered, copy back->VRAM honoring the HW pitch. The
-   device scans out VRAM continuously, so there is nothing else to present. */
+/* fb_flip: if double-buffered, copy back->VRAM honoring the HW pitch, then
+   force the device to present (fb_svga_update). */
 int fb_flip(framebuffer_t* fb) {
 	if (fb->back != NULL) {
 		size_t   y, rows = (size_t)fb->info.fb_height;
@@ -295,7 +320,7 @@ int fb_flip(framebuffer_t* fb) {
 			       src + y * fb->back_stride,
 			       fb->back_stride);
 	}
-	return 0;
+	return fb_svga_update(fb, 0, 0, fb->info.fb_width, fb->info.fb_height);
 }
 
 /* Real-time mode change: reprogram WIDTH/HEIGHT/BPP (disable/set/enable). VRAM
@@ -348,10 +373,23 @@ int fb_resize(framebuffer_t* fb, int width, int height) {
  * fbsvga.h: present + enable + (software-only) 2D.                   *
  * ------------------------------------------------------------------ */
 
-/* No FIFO on SVGA3: the device scans out VRAM continuously, so an "update" is
-   implicit. Kept as a no-op so the shared fbsvga.h API and callers work. */
+/*
+ * Present. SVGA3 has no FIFO, so there is no SVGA_CMD_UPDATE to enqueue. The
+ * device tracks CPU writes to the framebuffer (traces) but only flushes them
+ * to the visible screen on a device access -- without this, pixels sit in VRAM
+ * and appear "stuck" until some unrelated register touch (e.g. a keypress path)
+ * happens to force a VM exit. So we poke SVGA_REG_SYNC and drain SVGA_REG_BUSY:
+ * the register access forces the host to present the dirty framebuffer region.
+ * The BUSY drain is bounded so a device that never advertises BUSY can't hang.
+ */
 int fb_svga_update(framebuffer_t* fb, int x, int y, int w, int h) {
+	int guard = 1000000;
 	(void)fb; (void)x; (void)y; (void)w; (void)h;
+	if (!s_open)
+		return -1;
+	svga_write(SVGA_REG_SYNC, 1);
+	while (guard-- > 0 && svga_read(SVGA_REG_BUSY))
+		;
 	return 0;
 }
 
