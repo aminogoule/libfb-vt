@@ -34,13 +34,19 @@ PROG_SRC_SERVER=	server.c vtcon.c mouse.c kbd.c proto.c ppm.c
 PROG_SRC_CUBE=		cube.c vtcon.c
 PROG_SRC_GLCUBE=	glcube.c vtcon.c mgl.c
 PROG_SRC_TERM=		term.c proto.c
+PROG_SRC_CUBEWIN=	cubewin.c proto.c mgl.c
 
 HDRS=		fb.h ppm.h vtcon.h fbsvga.h mouse.h kbd.h proto.h fontspleen.h mgl.h
 
-# term is a display-server *client*: it links no framebuffer backend (it only
-# talks the socket protocol + drives a pty), so it is one backend-independent
-# binary, built alongside every backend group.
-all: svga vga fb term
+# term and cubewin are display-server *clients*: they link no framebuffer
+# backend (they only talk the socket protocol, drawing into the shared
+# window buffer the compositor hands them), so each is one
+# backend-independent binary, built alongside every backend group.
+all: svga vga fb term cubewin
+
+# ---- windowed GL cube client (backend-independent, like term) -------
+cubewin: $(PROG_SRC_CUBEWIN) proto.h mgl.h
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBEWIN) $(LIBM)
 
 svga: ppm2fb.svga fbshow.svga server.svga cube.svga glcube.svga
 vga:  ppm2fb.vga  fbshow.vga  server.vga  cube.vga  glcube.vga
@@ -92,7 +98,7 @@ clean:
 	      server.fb server.vga server.svga \
 	      cube.fb   cube.vga   cube.svga \
 	      glcube.fb glcube.vga glcube.svga \
-	      term \
+	      term cubewin \
 	      *.o
 
 .PHONY: all svga vga fb clean
