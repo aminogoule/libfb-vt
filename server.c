@@ -86,14 +86,23 @@
 enum { MENU_ACT_CLOSE, MENU_ACT_TOBACK, MENU_ACT_NEW_TERM,
        MENU_ACT_EDITOR, MENU_ACT_NEW_ITEM, MENU_ACT_RESOLUTION };
 
-/* Preset resolutions the desktop menu cycles through (see MENU_ACT_RESOLUTION).
-   Only takes effect on a backend whose fb_resize() actually works (fb_svga.c
-   for now; vt_fb/legacy VGA silently no-op, see fb.h). */
-static const struct { int w, h; } RES_PRESET[] = {
-	{ 640,  480 }, { 800,  600 }, { 1024, 768 }, { 1280, 1024 }, { 1920, 1080 },
+/* Standard VGA/SVGA + a few WXGA resolutions, offered as a submenu off the
+   desktop menu's "Resolution" item (see open_resolution_submenu()). Only
+   takes effect on a backend whose fb_resize() actually works (fb_svga.c for
+   now; vt_fb/legacy VGA silently no-op, see fb.h). */
+static const struct { const char* label; int w, h; } RES_PRESET[] = {
+	{ "640x480 (VGA)",       640,  480  },
+	{ "800x600 (SVGA)",      800,  600  },
+	{ "1024x768 (XGA)",      1024, 768  },
+	{ "1152x864 (XGA+)",     1152, 864  },
+	{ "1280x1024 (SXGA)",    1280, 1024 },
+	{ "1280x800 (WXGA)",     1280, 800  },
+	{ "1366x768 (WXGA HD)",  1366, 768  },
+	{ "1440x900 (WXGA+)",    1440, 900  },
+	{ "1680x1050 (WSXGA+)",  1680, 1050 },
+	{ "1920x1080 (FHD)",     1920, 1080 },
 };
 #define N_RES_PRESET (int)(sizeof(RES_PRESET) / sizeof(RES_PRESET[0]))
-static int s_res_idx = 2;   /* matches fb_svga.c's fb_open() default 1024x768 */
 
 /* ------------------------------------------------------------------ *
  * A surface == one client window. The array order IS the z-order:     *
@@ -137,10 +146,19 @@ static int       s_menu_x, s_menu_y;
 static int          s_menu_nitems;
 static const char*  s_menu_label[MENU_MAXITEMS];
 static int          s_menu_act[MENU_MAXITEMS];
-static char          s_menu_reslabel[32];  /* formatted "Resolution: WxH" text */
 
-/* Set by the menu's MENU_ACT_RESOLUTION action; applied in main()'s loop
-   (fb_resize() needs the framebuffer_t*, which only main() has in scope). */
+/* The one-level-deep flyout off the desktop menu's "Resolution" item: same
+   rendering/hit-test shape as the top menu, but its items are resolutions
+   (from RES_PRESET) rather than generic actions -- simpler than threading a
+   second generic action set through for a single-purpose submenu. */
+static int          s_submenu_open;
+static int          s_submenu_x, s_submenu_y;
+static int          s_submenu_nitems;
+static const char*  s_submenu_label[N_RES_PRESET];
+static int          s_submenu_w[N_RES_PRESET], s_submenu_h[N_RES_PRESET];
+
+/* Set by the resolution submenu; applied in main()'s loop (fb_resize()
+   needs the framebuffer_t*, which only main() has in scope). */
 static int       s_resize_req = 0;
 static int       s_resize_w, s_resize_h;
 
@@ -291,8 +309,9 @@ static void spawn_client(const char* cmd);
 static void open_sys_menu(surface_t* s) {
 	int bx, by;
 	titlebar_btn_rect(s, &bx, &by);
-	s_menu_surf_id = s->id;
-	s_menu_nitems  = 0;
+	s_menu_surf_id  = s->id;
+	s_menu_nitems   = 0;
+	s_submenu_open  = 0;
 	s_menu_label[s_menu_nitems] = "Close";
 	s_menu_act[s_menu_nitems++] = MENU_ACT_CLOSE;
 	s_menu_label[s_menu_nitems] = "Send to back";
@@ -309,6 +328,7 @@ static void open_sys_menu(surface_t* s) {
 static void open_desktop_menu(int mx, int my, int hit_idx) {
 	s_menu_surf_id = (hit_idx >= 0) ? s_surf[hit_idx].id : 0;
 	s_menu_nitems  = 0;
+	s_submenu_open = 0;
 	s_menu_label[s_menu_nitems] = "New terminal";
 	s_menu_act[s_menu_nitems++] = MENU_ACT_NEW_TERM;
 	if (hit_idx >= 0) {
@@ -319,12 +339,7 @@ static void open_desktop_menu(int mx, int my, int hit_idx) {
 	s_menu_act[s_menu_nitems++] = MENU_ACT_EDITOR;
 	s_menu_label[s_menu_nitems] = "New item";
 	s_menu_act[s_menu_nitems++] = MENU_ACT_NEW_ITEM;
-	{
-		int next = (s_res_idx + 1) % N_RES_PRESET;
-		snprintf(s_menu_reslabel, sizeof(s_menu_reslabel), "Resolution: %dx%d",
-		         RES_PRESET[next].w, RES_PRESET[next].h);
-	}
-	s_menu_label[s_menu_nitems] = s_menu_reslabel;
+	s_menu_label[s_menu_nitems] = "Resolution >";
 	s_menu_act[s_menu_nitems++] = MENU_ACT_RESOLUTION;
 
 	s_menu_x = mx;
@@ -335,6 +350,28 @@ static void open_desktop_menu(int mx, int my, int hit_idx) {
 	if (s_menu_x < 0) s_menu_x = 0;
 	if (s_menu_y < 0) s_menu_y = 0;
 	s_menu_open = 1;
+}
+
+/* Open the resolution flyout, normally just to the right of the parent
+   menu (parent_x = the parent menu's own left edge, row_y = the "Resolution"
+   row's y), flipped to the parent's left if it wouldn't fit on screen.
+   Does NOT close the parent menu; both stay open together. */
+static void open_resolution_submenu(int parent_x, int row_y) {
+	int i;
+	s_submenu_nitems = N_RES_PRESET;
+	for (i = 0; i < N_RES_PRESET; i++) {
+		s_submenu_label[i] = RES_PRESET[i].label;
+		s_submenu_w[i]     = RES_PRESET[i].w;
+		s_submenu_h[i]     = RES_PRESET[i].h;
+	}
+	s_submenu_x = parent_x + MENU_W;
+	if (s_submenu_x + MENU_W > g_w) s_submenu_x = parent_x - MENU_W;
+	if (s_submenu_x < 0) s_submenu_x = 0;
+	s_submenu_y = row_y;
+	if (s_submenu_y + s_submenu_nitems * MENU_ITEM_H > g_h)
+		s_submenu_y = g_h - s_submenu_nitems * MENU_ITEM_H;
+	if (s_submenu_y < 0) s_submenu_y = 0;
+	s_submenu_open = 1;
 }
 
 /* Simple 12x16 arrow pointer, drawn with a 1px black outline so it stays
@@ -360,6 +397,21 @@ static void draw_cursor(int mx, int my) {
 		for (col = 0; col < 12; col++)
 			if (rows[row] & (0x8000 >> col))
 				put_px(mx + col, my + row, 0xFFFFFF);
+}
+
+/* Draw one dropdown box (the top-level menu or the resolution flyout):
+   background, 1px border, then each item's label. Shared by both so they
+   never look inconsistent with each other. */
+static void draw_menu_box(int x, int y, int nitems, const char* const* label) {
+	int i, h = nitems * MENU_ITEM_H;
+	fill_rect(x, y, MENU_W, h, MENU_BG);
+	fill_rect(x, y, MENU_W, 1, MENU_BORDER);
+	fill_rect(x, y + h - 1, MENU_W, 1, MENU_BORDER);
+	fill_rect(x, y, 1, h, MENU_BORDER);
+	fill_rect(x + MENU_W - 1, y, 1, h, MENU_BORDER);
+	for (i = 0; i < nitems; i++)
+		draw_string(x + 8, y + i * MENU_ITEM_H + (MENU_ITEM_H - GLYPH_H) / 2,
+		            label[i], MENU_TX);
 }
 
 /* Composite the whole scene: desktop, then every surface bottom-to-top with
@@ -400,18 +452,13 @@ static void composite(void) {
 		for (i = 0; !found && i < s_nsurf; i++)
 			if (s_surf[i].id == s_menu_surf_id) found = 1;
 		if (!found) {
-			s_menu_open = 0;          /* its surface closed itself meanwhile */
+			s_menu_open    = 0;       /* its surface closed itself meanwhile */
+			s_submenu_open = 0;
 		} else {
-			int mh = s_menu_nitems * MENU_ITEM_H;
-			fill_rect(s_menu_x, s_menu_y, MENU_W, mh, MENU_BG);
-			fill_rect(s_menu_x, s_menu_y, MENU_W, 1, MENU_BORDER);
-			fill_rect(s_menu_x, s_menu_y + mh - 1, MENU_W, 1, MENU_BORDER);
-			fill_rect(s_menu_x, s_menu_y, 1, mh, MENU_BORDER);
-			fill_rect(s_menu_x + MENU_W - 1, s_menu_y, 1, mh, MENU_BORDER);
-			for (i = 0; i < s_menu_nitems; i++)
-				draw_string(s_menu_x + 8,
-				            s_menu_y + i * MENU_ITEM_H + (MENU_ITEM_H - GLYPH_H) / 2,
-				            s_menu_label[i], MENU_TX);
+			draw_menu_box(s_menu_x, s_menu_y, s_menu_nitems, s_menu_label);
+			if (s_submenu_open)
+				draw_menu_box(s_submenu_x, s_submenu_y, s_submenu_nitems,
+				              s_submenu_label);
 		}
 	}
 
@@ -666,12 +713,33 @@ static int handle_mouse(int prev_buttons) {
 	if (pressed & MOUSE_BTN_LEFT) {
 		int consumed = 0;
 
+		/* the resolution flyout, if open, gets first say: a hit picks a
+		   resolution and closes both menus, a miss falls through to the
+		   parent menu below (so clicking elsewhere in the parent, or
+		   dismissing entirely, still works in one click) */
+		if (s_submenu_open) {
+			int smh = s_submenu_nitems * MENU_ITEM_H;
+			if (s_mouse.x >= s_submenu_x && s_mouse.x < s_submenu_x + MENU_W &&
+			    s_mouse.y >= s_submenu_y && s_mouse.y < s_submenu_y + smh) {
+				int sitem = (s_mouse.y - s_submenu_y) / MENU_ITEM_H;
+				if (sitem >= 0 && sitem < s_submenu_nitems) {
+					s_resize_w   = s_submenu_w[sitem];
+					s_resize_h   = s_submenu_h[sitem];
+					s_resize_req = 1;
+				}
+				s_menu_open    = 0;
+				s_submenu_open = 0;
+				consumed = 1;
+			}
+		}
+
 		/* an open menu eats the next left click: either it hit an item (act
 		   on it) or it didn't (just dismiss, then fall through to ordinary
 		   click handling below for whatever's under the pointer) */
-		if (s_menu_open) {
+		if (!consumed && s_menu_open) {
 			int mh = s_menu_nitems * MENU_ITEM_H;
-			s_menu_open = 0;
+			s_menu_open    = 0;
+			s_submenu_open = 0;
 			if (s_mouse.x >= s_menu_x && s_mouse.x < s_menu_x + MENU_W &&
 			    s_mouse.y >= s_menu_y && s_mouse.y < s_menu_y + mh) {
 				int item = (s_mouse.y - s_menu_y) / MENU_ITEM_H;
@@ -695,10 +763,11 @@ static int handle_mouse(int prev_buttons) {
 						spawn_client("TERM_CMD=vim ./term");
 						break;
 					case MENU_ACT_RESOLUTION:
-						s_res_idx    = (s_res_idx + 1) % N_RES_PRESET;
-						s_resize_w   = RES_PRESET[s_res_idx].w;
-						s_resize_h   = RES_PRESET[s_res_idx].h;
-						s_resize_req = 1;
+						/* re-open: a flyout, not an action -- keep the
+						   parent menu up so both render together */
+						open_resolution_submenu(s_menu_x,
+						                         s_menu_y + item * MENU_ITEM_H);
+						s_menu_open = 1;
 						break;
 					case MENU_ACT_NEW_ITEM:
 					default:
@@ -792,7 +861,8 @@ static void apply_resize(framebuffer_t* fb) {
 		if (s->y < FRAME + TITLE) s->y = FRAME + TITLE;
 	}
 
-	s_menu_open = 0;      /* its screen coords may no longer make sense */
+	s_menu_open    = 0;   /* its screen coords may no longer make sense */
+	s_submenu_open = 0;
 }
 
 /* ------------------------------------------------------------------ *
