@@ -76,15 +76,24 @@
    id (0 == desktop, no surface) -- rendered and hit-tested the same way. */
 #define BTN_SIZE      14         /* system-menu button square, in TITLE   */
 #define BTN_MARGIN     3         /* gap from the frame edge               */
-#define MENU_W       165         /* fits "Open editor (vim)" + margin     */
+#define MENU_W       190         /* fits "Resolution: 1920x1080" + margin */
 #define MENU_ITEM_H   18
-#define MENU_MAXITEMS  4
+#define MENU_MAXITEMS  5
 #define MENU_BG      0xEEEEF2u
 #define MENU_BORDER  0x8890A0u
 #define MENU_TX      0x101820u
 
 enum { MENU_ACT_CLOSE, MENU_ACT_TOBACK, MENU_ACT_NEW_TERM,
-       MENU_ACT_EDITOR, MENU_ACT_NEW_ITEM };
+       MENU_ACT_EDITOR, MENU_ACT_NEW_ITEM, MENU_ACT_RESOLUTION };
+
+/* Preset resolutions the desktop menu cycles through (see MENU_ACT_RESOLUTION).
+   Only takes effect on a backend whose fb_resize() actually works (fb_svga.c
+   for now; vt_fb/legacy VGA silently no-op, see fb.h). */
+static const struct { int w, h; } RES_PRESET[] = {
+	{ 640,  480 }, { 800,  600 }, { 1024, 768 }, { 1280, 1024 }, { 1920, 1080 },
+};
+#define N_RES_PRESET (int)(sizeof(RES_PRESET) / sizeof(RES_PRESET[0]))
+static int s_res_idx = 2;   /* matches fb_svga.c's fb_open() default 1024x768 */
 
 /* ------------------------------------------------------------------ *
  * A surface == one client window. The array order IS the z-order:     *
@@ -128,6 +137,12 @@ static int       s_menu_x, s_menu_y;
 static int          s_menu_nitems;
 static const char*  s_menu_label[MENU_MAXITEMS];
 static int          s_menu_act[MENU_MAXITEMS];
+static char          s_menu_reslabel[32];  /* formatted "Resolution: WxH" text */
+
+/* Set by the menu's MENU_ACT_RESOLUTION action; applied in main()'s loop
+   (fb_resize() needs the framebuffer_t*, which only main() has in scope). */
+static int       s_resize_req = 0;
+static int       s_resize_w, s_resize_h;
 
 /* raw-scancode keyboard decoding (opt-in via -k, see kbd.h). Off by default
    -- K_XLATE already handles plain typing/arrows/F-keys correctly; K_CODE is
@@ -304,6 +319,13 @@ static void open_desktop_menu(int mx, int my, int hit_idx) {
 	s_menu_act[s_menu_nitems++] = MENU_ACT_EDITOR;
 	s_menu_label[s_menu_nitems] = "New item";
 	s_menu_act[s_menu_nitems++] = MENU_ACT_NEW_ITEM;
+	{
+		int next = (s_res_idx + 1) % N_RES_PRESET;
+		snprintf(s_menu_reslabel, sizeof(s_menu_reslabel), "Resolution: %dx%d",
+		         RES_PRESET[next].w, RES_PRESET[next].h);
+	}
+	s_menu_label[s_menu_nitems] = s_menu_reslabel;
+	s_menu_act[s_menu_nitems++] = MENU_ACT_RESOLUTION;
 
 	s_menu_x = mx;
 	s_menu_y = my;
@@ -672,6 +694,12 @@ static int handle_mouse(int prev_buttons) {
 					case MENU_ACT_EDITOR:
 						spawn_client("TERM_CMD=vim ./term");
 						break;
+					case MENU_ACT_RESOLUTION:
+						s_res_idx    = (s_res_idx + 1) % N_RES_PRESET;
+						s_resize_w   = RES_PRESET[s_res_idx].w;
+						s_resize_h   = RES_PRESET[s_res_idx].h;
+						s_resize_req = 1;
+						break;
 					case MENU_ACT_NEW_ITEM:
 					default:
 						break;          /* placeholder, intentionally no-op */
@@ -730,6 +758,41 @@ static int handle_mouse(int prev_buttons) {
 	}
 
 	return dirty;
+}
+
+/* Apply a pending MENU_ACT_RESOLUTION request (see s_resize_req). Only
+   works on a backend whose fb_resize() is real (fb_svga.c); on vt_fb/legacy
+   VGA it just fails and we say so once to stderr. On success, every piece
+   of state sized off the old g_w/g_h gets re-derived: the mouse clamp
+   bounds, every window's on-screen position, and a full repaint. */
+static void apply_resize(framebuffer_t* fb) {
+	int i;
+
+	if (fb_resize(fb, s_resize_w, s_resize_h) != 0) {
+		fprintf(stderr, "server: fb_resize(%dx%d): %s (backend doesn't "
+		        "support real-time mode changes)\n",
+		        s_resize_w, s_resize_h, strerror(errno));
+		return;
+	}
+
+	g_w = fb->info.fb_width;
+	g_h = fb->info.fb_height;
+
+	if (s_mouse_ok) {
+		mouse_set_bounds(&s_mouse, g_w - 1, g_h - 1);
+		if (s_mouse.x > g_w - 1) s_mouse.x = g_w - 1;
+		if (s_mouse.y > g_h - 1) s_mouse.y = g_h - 1;
+	}
+
+	for (i = 0; i < s_nsurf; i++) {
+		surface_t* s = &s_surf[i];
+		if (s->x + s->w + FRAME > g_w) s->x = g_w - FRAME - s->w;
+		if (s->y + s->h + FRAME > g_h) s->y = g_h - FRAME - s->h;
+		if (s->x < FRAME)        s->x = FRAME;
+		if (s->y < FRAME + TITLE) s->y = FRAME + TITLE;
+	}
+
+	s_menu_open = 0;      /* its screen coords may no longer make sense */
 }
 
 /* ------------------------------------------------------------------ *
@@ -923,6 +986,12 @@ int main(int argc, char* argv[]) {
 				if (handle_mouse(prev_buttons))
 					dirty = 1;
 			}
+		}
+
+		if (s_resize_req) {
+			s_resize_req = 0;
+			apply_resize(fb);
+			dirty = 1;
 		}
 
 		/* new client connections */
