@@ -70,6 +70,18 @@
 #define TITLEBAR2 0x54606Fu      /* unfocused title bar (grey)           */
 #define TITLETX   0xFFFFFFu      /* title text                           */
 
+/* titlebar system-menu button (top-right corner icon) and its dropdown */
+#define BTN_SIZE     14          /* button square, within the TITLE strip */
+#define BTN_MARGIN    3          /* gap from the frame edge               */
+#define MENU_W      130
+#define MENU_ITEM_H  18
+#define MENU_BG     0xEEEEF2u
+#define MENU_BORDER 0x8890A0u
+#define MENU_TX     0x101820u
+
+enum { MENU_ACT_CLOSE, MENU_ACT_TOBACK, MENU_NITEMS };
+static const char* const MENU_ITEMS[MENU_NITEMS] = { "Close", "Send to back" };
+
 /* ------------------------------------------------------------------ *
  * A surface == one client window. The array order IS the z-order:     *
  * index 0 is the bottom window, the last is the top (focused) one.    *
@@ -100,6 +112,13 @@ static mouse_t   s_mouse;
 static int       s_mouse_ok  = 0;
 static int       s_drag_idx  = -1;   /* index into s_surf being dragged, or -1 */
 static int       s_drag_off_x, s_drag_off_y;  /* mouse offset from surface origin */
+
+/* titlebar system-menu: opened by clicking the corner button, closed by any
+   subsequent click (on an item, or anywhere else to dismiss). Tracked by
+   surface id rather than index since z-order can change while it's open. */
+static int       s_menu_open    = 0;
+static uint32_t  s_menu_surf_id = 0;
+static int       s_menu_x, s_menu_y;
 
 /* raw-scancode keyboard decoding (opt-in via -k, see kbd.h). Off by default
    -- K_XLATE already handles plain typing/arrows/F-keys correctly; K_CODE is
@@ -226,6 +245,20 @@ static void surface_chrome_rect(const surface_t* s,
 	*oh = s->h + 2 * FRAME + TITLE;
 }
 
+/* Top-left corner of the system-menu button, in screen coords. */
+static void titlebar_btn_rect(const surface_t* s, int* bx, int* by) {
+	int ox, oy, ow, oh;
+	surface_chrome_rect(s, &ox, &oy, &ow, &oh);
+	*bx = ox + ow - FRAME - BTN_MARGIN - BTN_SIZE;
+	*by = oy + (TITLE - BTN_SIZE) / 2;
+}
+
+static int titlebar_btn_hit(const surface_t* s, int mx, int my) {
+	int bx, by;
+	titlebar_btn_rect(s, &bx, &by);
+	return mx >= bx && mx < bx + BTN_SIZE && my >= by && my < by + BTN_SIZE;
+}
+
 /* Simple 12x16 arrow pointer, drawn with a 1px black outline so it stays
    visible over any background, white fill. Hotspot is the top-left pixel. */
 static void draw_cursor(int mx, int my) {
@@ -275,7 +308,33 @@ static void composite(void) {
 		if (s->title[0])
 			draw_string(ox + 6, oy + (TITLE - GLYPH_H) / 2,
 			            s->title, TITLETX);
+		{                                       /* system-menu button icon */
+			int bx, by, ly;
+			titlebar_btn_rect(s, &bx, &by);
+			for (ly = 0; ly < 3; ly++)
+				fill_rect(bx + 2, by + 2 + ly * 5, BTN_SIZE - 4, 2, TITLETX);
+		}
 		blit_surface(s);                                         /* pixels   */
+	}
+
+	if (s_menu_open) {
+		int i, found = 0;
+		for (i = 0; i < s_nsurf; i++)
+			if (s_surf[i].id == s_menu_surf_id) { found = 1; break; }
+		if (!found) {
+			s_menu_open = 0;          /* its surface closed itself meanwhile */
+		} else {
+			int mh = MENU_NITEMS * MENU_ITEM_H;
+			fill_rect(s_menu_x, s_menu_y, MENU_W, mh, MENU_BG);
+			fill_rect(s_menu_x, s_menu_y, MENU_W, 1, MENU_BORDER);
+			fill_rect(s_menu_x, s_menu_y + mh - 1, MENU_W, 1, MENU_BORDER);
+			fill_rect(s_menu_x, s_menu_y, 1, mh, MENU_BORDER);
+			fill_rect(s_menu_x + MENU_W - 1, s_menu_y, 1, mh, MENU_BORDER);
+			for (i = 0; i < MENU_NITEMS; i++)
+				draw_string(s_menu_x + 8,
+				            s_menu_y + i * MENU_ITEM_H + (MENU_ITEM_H - GLYPH_H) / 2,
+				            MENU_ITEMS[i], MENU_TX);
+		}
 	}
 
 	if (s_mouse_ok)
@@ -477,6 +536,26 @@ static void surface_raise(int i) {
 	s_surf[s_nsurf - 1] = tmp;
 }
 
+/* Move surface i to the bottom of the z-order ("send to back"). */
+static void surface_lower(int i) {
+	surface_t tmp;
+	if (i <= 0)
+		return;
+	tmp = s_surf[i];
+	memmove(&s_surf[1], &s_surf[0], (size_t)i * sizeof(s_surf[0]));
+	s_surf[0] = tmp;
+}
+
+/* Politely ask a surface's client to go away (see FBVT_CLOSE); the client
+   closes its socket in response and the usual poll/EOF path reaps it. */
+static void surface_request_close(surface_t* s) {
+	struct fbvt_msg m;
+	memset(&m, 0, sizeof(m));
+	m.type = FBVT_CLOSE;
+	m.id   = s->id;
+	(void)fbvt_send(s->fd, &m, NULL);
+}
+
 /* Forward one pointer event to the focused (topmost) surface. (rx,ry) are
    already relative to that surface's content area. */
 static void route_mouse(int rx, int ry, int buttons, int dz) {
@@ -507,15 +586,52 @@ static int handle_mouse(int prev_buttons) {
 	int dirty   = 1;                     /* the cursor itself always moved */
 
 	if (pressed & MOUSE_BTN_LEFT) {
-		int titlebar = 0;
-		int hit = surface_at(s_mouse.x, s_mouse.y, &titlebar);
-		if (hit >= 0) {
-			surface_raise(hit);
-			if (titlebar) {
-				surface_t* s = &s_surf[s_nsurf - 1];
-				s_drag_idx   = s_nsurf - 1;
-				s_drag_off_x = s_mouse.x - s->x;
-				s_drag_off_y = s_mouse.y - s->y;
+		int consumed = 0;
+
+		/* an open system menu eats the next left click: either it hit an
+		   item (act on it) or it didn't (just dismiss, then fall through to
+		   ordinary click handling below for whatever's under the pointer) */
+		if (s_menu_open) {
+			int mh = MENU_NITEMS * MENU_ITEM_H;
+			s_menu_open = 0;
+			if (s_mouse.x >= s_menu_x && s_mouse.x < s_menu_x + MENU_W &&
+			    s_mouse.y >= s_menu_y && s_mouse.y < s_menu_y + mh) {
+				int item = (s_mouse.y - s_menu_y) / MENU_ITEM_H;
+				int i;
+				for (i = 0; i < s_nsurf; i++)
+					if (s_surf[i].id == s_menu_surf_id)
+						break;
+				if (i < s_nsurf) {
+					if (item == MENU_ACT_CLOSE)
+						surface_request_close(&s_surf[i]);
+					else if (item == MENU_ACT_TOBACK)
+						surface_lower(i);
+				}
+				consumed = 1;
+			}
+		}
+
+		if (!consumed) {
+			int titlebar = 0;
+			int hit = surface_at(s_mouse.x, s_mouse.y, &titlebar);
+			if (hit >= 0) {
+				surface_raise(hit);
+				if (titlebar) {
+					surface_t* s = &s_surf[s_nsurf - 1];
+					if (titlebar_btn_hit(s, s_mouse.x, s_mouse.y)) {
+						int bx, by;
+						titlebar_btn_rect(s, &bx, &by);
+						s_menu_open    = 1;
+						s_menu_surf_id = s->id;
+						s_menu_x       = bx + BTN_SIZE - MENU_W;
+						if (s_menu_x < 0) s_menu_x = 0;
+						s_menu_y       = by + BTN_SIZE + 2;
+					} else {
+						s_drag_idx   = s_nsurf - 1;
+						s_drag_off_x = s_mouse.x - s->x;
+						s_drag_off_y = s_mouse.y - s->y;
+					}
+				}
 			}
 		}
 	}
