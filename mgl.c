@@ -28,6 +28,14 @@ struct mgl_ctx {
 	float*   depthbuf;       /* width*height, valid within vw/vh */
 	int      depth_alloc_w, depth_alloc_h;
 
+	/* internal, tightly-packed colour back buffer -- all drawing lands here;
+	   mgl_swap_buffers() blits it to the real (possibly padded-stride)
+	   target in one pass, so the caller's visible buffer is never seen
+	   half-drawn (avoids flicker/tearing, same idea as fb.c's back buffer). */
+	uint8_t* backbuf;
+	size_t   back_pitch;
+	int      back_alloc_w, back_alloc_h;
+
 	mgl_matrixmode_t mode;
 	mgl_mat4 mv_stack[MGL_STACK_DEPTH];
 	mgl_mat4 pr_stack[MGL_STACK_DEPTH];
@@ -99,6 +107,10 @@ mgl_ctx_t* mgl_create(int width, int height) {
 		c->depthbuf = malloc((size_t)width * (size_t)height * sizeof(float));
 		c->depth_alloc_w = width;
 		c->depth_alloc_h = height;
+		c->backbuf = malloc((size_t)width * (size_t)height * 4);
+		c->back_alloc_w = width;
+		c->back_alloc_h = height;
+		c->back_pitch = (size_t)width * 4;
 	}
 	c->width = width;
 	c->height = height;
@@ -111,6 +123,7 @@ void mgl_destroy(mgl_ctx_t* ctx) {
 	if (ctx == NULL)
 		return;
 	free(ctx->depthbuf);
+	free(ctx->backbuf);
 	free(ctx);
 	if (g_ctx == ctx)
 		g_ctx = NULL;
@@ -139,6 +152,16 @@ void mgl_set_target(uint8_t* buf, size_t pitch, int width, int height) {
 			c->depth_alloc_h = height;
 		}
 	}
+	if (width > c->back_alloc_w || height > c->back_alloc_h) {
+		size_t need = (size_t)width * (size_t)height * 4;
+		uint8_t* nb = realloc(c->backbuf, need);
+		if (nb != NULL) {
+			c->backbuf = nb;
+			c->back_alloc_w = width;
+			c->back_alloc_h = height;
+		}
+	}
+	c->back_pitch = (size_t)width * 4;
 }
 
 void mgl_viewport(int x, int y, int w, int h) {
@@ -156,27 +179,40 @@ void mgl_clear_color(float r, float g, float b, float a) {
 	g_ctx->clear_r = r; g_ctx->clear_g = g; g_ctx->clear_b = b; g_ctx->clear_a = a;
 }
 
+/* Clears (colour and/or depth) are scoped to the current viewport rect, not
+   the whole target -- glcube.c's mgl target is the *whole screen* buffer
+   (desktop + window chrome are hand-drawn into the rest of it outside the
+   cube's viewport), so a full-buffer clear/swap would wipe that. */
 void mgl_clear(int color, int depth) {
 	mgl_ctx_t* c = g_ctx;
-	int x, y;
-	if (c == NULL || c->buf == NULL)
+	int x, y, x0, y0, x1, y1;
+	if (c == NULL)
 		return;
 
-	if (color) {
+	x0 = c->vx; y0 = c->vy;
+	x1 = c->vx + c->vw; y1 = c->vy + c->vh;
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > c->width)  x1 = c->width;
+	if (y1 > c->height) y1 = c->height;
+
+	if (color && c->backbuf != NULL) {
 		unsigned r = (unsigned)(c->clear_r * 255.0f);
 		unsigned g = (unsigned)(c->clear_g * 255.0f);
 		unsigned b = (unsigned)(c->clear_b * 255.0f);
 		uint32_t px = (r << 16) | (g << 8) | b;
-		for (y = 0; y < c->height; y++) {
-			uint32_t* line = (uint32_t*)(c->buf + (size_t)y * c->pitch);
-			for (x = 0; x < c->width; x++)
+		for (y = y0; y < y1; y++) {
+			uint32_t* line = (uint32_t*)(c->backbuf + (size_t)y * c->back_pitch);
+			for (x = x0; x < x1; x++)
 				line[x] = px;
 		}
 	}
 	if (depth && c->depthbuf != NULL) {
-		size_t n = (size_t)c->width * (size_t)c->height;
-		for (x = 0; x < (int)n; x++)
-			c->depthbuf[x] = 1.0f;
+		for (y = y0; y < y1; y++) {
+			float* line = c->depthbuf + (size_t)y * (size_t)c->width;
+			for (x = x0; x < x1; x++)
+				line[x] = 1.0f;
+		}
 	}
 }
 
@@ -351,7 +387,35 @@ static void put_px_depth(mgl_ctx_t* c, int x, int y, float depth, uint32_t col) 
 			return;
 		c->depthbuf[idx] = depth;
 	}
-	*(uint32_t*)(c->buf + (size_t)y * c->pitch + (size_t)x * 4) = col;
+	if (c->backbuf == NULL)
+		return;
+	*(uint32_t*)(c->backbuf + (size_t)y * c->back_pitch + (size_t)x * 4) = col;
+}
+
+/* Blit the internal back buffer to the real target buffer, scoped to the
+   current viewport rect (see mgl_clear's comment above), in one pass. Call
+   once per frame, after all drawing is done and before the caller presents
+   the target (fb_flip() / FBVT_COMMIT) -- avoids the target ever being
+   visible half-drawn. */
+void mgl_swap_buffers(void) {
+	mgl_ctx_t* c = g_ctx;
+	int y, x0, y0, y1, vw;
+	if (c == NULL || c->buf == NULL || c->backbuf == NULL)
+		return;
+
+	x0 = c->vx; y0 = c->vy; y1 = c->vy + c->vh;
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (y1 > c->height) y1 = c->height;
+	vw = c->vw;
+	if (x0 + vw > c->width) vw = c->width - x0;
+	if (vw <= 0)
+		return;
+
+	for (y = y0; y < y1; y++)
+		memcpy(c->buf     + (size_t)y * c->pitch      + (size_t)x0 * 4,
+		       c->backbuf + (size_t)y * c->back_pitch + (size_t)x0 * 4,
+		       (size_t)vw * 4);
 }
 
 static inline int fclampi(float v, int lo, int hi) {

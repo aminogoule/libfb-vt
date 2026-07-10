@@ -22,6 +22,11 @@
  *   - no texturing, no GL_LIGHTING, no clipping beyond a whole-primitive
  *     near-plane reject (a triangle straddling w<=0 is dropped, not split)
  *
+ * Double-buffered internally: all drawing lands in a private back buffer;
+ * mgl_swap_buffers() blits it to the real target in one pass right before
+ * you present (fb_flip() / FBVT_COMMIT), so the caller's visible buffer is
+ * never seen half-drawn.
+ *
  * Single current context (a real global, same as desktop GL's implicit
  * per-thread current context) -- fine for one render loop per process.
  */
@@ -63,6 +68,11 @@ void mgl_clear_color(float r, float g, float b, float a);
 void mgl_clear(int color, int depth);
 void mgl_enable_depth_test(int on);
 void mgl_enable_cull_face(int on);
+
+/* Blit the internal back buffer to the real target buffer (see mgl_set_target)
+   in one pass. Call once per frame after mgl_end() calls are done, before
+   presenting. */
+void mgl_swap_buffers(void);
 
 /* ---- matrix stack ---- */
 void mgl_matrix_mode(mgl_matrixmode_t m);

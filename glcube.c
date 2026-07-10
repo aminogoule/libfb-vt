@@ -36,6 +36,10 @@
 #define CHROME    0xC8CCD4u
 #define TITLEBAR  0x2A5AB8u
 
+#define BG_R (((BG_CLIENT >> 16) & 0xFF) / 255.0f)
+#define BG_G (((BG_CLIENT >>  8) & 0xFF) / 255.0f)
+#define BG_B (( BG_CLIENT        & 0xFF) / 255.0f)
+
 static int      g_w, g_h;
 static uint8_t* g_buf;
 static size_t   g_pitch;
@@ -76,11 +80,8 @@ static void gl_cube_render(mgl_ctx_t* ctx, int wx, int wy, double t) {
 
 	mgl_set_target(g_buf, g_pitch, g_w, g_h);
 	mgl_viewport(wx, wy, WIN_W, WIN_H);
-
-	/* only clear the client area's colour; depth buffer is shared with the
-	   whole screen but that's fine since nothing else writes it */
-	fill_rect(wx, wy, WIN_W, WIN_H, BG_CLIENT);
-	mgl_clear(0, 1);   /* depth only -- colour already hand-cleared above */
+	mgl_clear_color(BG_R, BG_G, BG_B, 1.0f);
+	mgl_clear(1, 1);   /* colour+depth, scoped to the viewport (see mgl.h) */
 
 	mgl_matrix_mode(MGL_PROJECTION);
 	mgl_load_identity();
@@ -94,7 +95,14 @@ static void gl_cube_render(mgl_ctx_t* ctx, int wx, int wy, double t) {
 	mgl_rotate((float)(t * 0.35 * 180.0 / M_PI), 0.0f, 0.0f, 1.0f);
 
 	mgl_enable_depth_test(1);
-	mgl_enable_cull_face(1);
+	/* Double-sided: CUBE_F's vertex order isn't consistently CCW-outward for
+	   every face (cube.c's own renderer papers over this with an explicit
+	   per-face normal flip; mgl's cull test has no such correction). With
+	   culling on, exactly the two faces with "reversed" winding get treated
+	   as back-facing and dropped from the visible side, letting the far/back
+	   face bleed through -- the depth buffer alone is enough to hide occluded
+	   faces correctly regardless of winding, so just don't cull. */
+	mgl_enable_cull_face(0);
 
 	mgl_begin(MGL_QUADS);
 	for (f = 0; f < 6; f++) {
@@ -105,6 +113,7 @@ static void gl_cube_render(mgl_ctx_t* ctx, int wx, int wy, double t) {
 			mgl_vertex3f(CUBE_V[F[j]][0], CUBE_V[F[j]][1], CUBE_V[F[j]][2]);
 	}
 	mgl_end();
+	mgl_swap_buffers();
 	(void)ctx;
 }
 

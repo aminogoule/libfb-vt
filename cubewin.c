@@ -72,23 +72,15 @@ static const float CUBE_COL[6][3] = {
 	{0.88f,0.75f,0.25f}, {0.75f,0.31f,0.82f}, {0.25f,0.78f,0.75f},
 };
 
-static void fill_win(win_t* w, uint32_t col) {
-	int x, y;
-	for (y = 0; y < w->ph; y++) {
-		uint32_t* line = (uint32_t*)((uint8_t*)w->pix + (size_t)y * w->stride);
-		for (x = 0; x < w->pw; x++)
-			line[x] = col;
-	}
-}
-
 static void gl_cube_render(win_t* w, double t) {
 	int f;
 
 	mgl_set_target((uint8_t*)w->pix, w->stride, w->pw, w->ph);
 	mgl_viewport(0, 0, w->pw, w->ph);
-
-	fill_win(w, BG_CLIENT);
-	mgl_clear(0, 1);   /* depth only -- colour already hand-cleared above */
+	mgl_clear_color((((BG_CLIENT >> 16) & 0xFF) / 255.0f),
+	                (((BG_CLIENT >>  8) & 0xFF) / 255.0f),
+	                (( BG_CLIENT        & 0xFF) / 255.0f), 1.0f);
+	mgl_clear(1, 1);
 
 	mgl_matrix_mode(MGL_PROJECTION);
 	mgl_load_identity();
@@ -102,7 +94,11 @@ static void gl_cube_render(win_t* w, double t) {
 	mgl_rotate((float)(t * 0.35 * 180.0 / M_PI), 0.0f, 0.0f, 1.0f);
 
 	mgl_enable_depth_test(1);
-	mgl_enable_cull_face(1);
+	/* Double-sided: see glcube.c's gl_cube_render for why culling is off --
+	   CUBE_F's winding isn't consistently outward-CCW for every face, so
+	   culling drops the wrong faces and the far side bleeds through. The
+	   depth buffer alone hides occluded faces correctly either way. */
+	mgl_enable_cull_face(0);
 
 	mgl_begin(MGL_QUADS);
 	for (f = 0; f < 6; f++) {
@@ -113,6 +109,7 @@ static void gl_cube_render(win_t* w, double t) {
 			mgl_vertex3f(CUBE_V[F[j]][0], CUBE_V[F[j]][1], CUBE_V[F[j]][2]);
 	}
 	mgl_end();
+	mgl_swap_buffers();
 }
 
 /* ------------------------------------------------------------------ *
