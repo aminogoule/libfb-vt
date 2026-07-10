@@ -70,17 +70,21 @@
 #define TITLEBAR2 0x54606Fu      /* unfocused title bar (grey)           */
 #define TITLETX   0xFFFFFFu      /* title text                           */
 
-/* titlebar system-menu button (top-right corner icon) and its dropdown */
-#define BTN_SIZE     14          /* button square, within the TITLE strip */
-#define BTN_MARGIN    3          /* gap from the frame edge               */
-#define MENU_W      130
-#define MENU_ITEM_H  18
-#define MENU_BG     0xEEEEF2u
-#define MENU_BORDER 0x8890A0u
-#define MENU_TX     0x101820u
+/* Popup menus: the per-window titlebar system-menu (LKM on its corner
+   button) and the desktop/window context menu (RMB anywhere). Both are one
+   generic dropdown -- a small item-label/action list plus a target surface
+   id (0 == desktop, no surface) -- rendered and hit-tested the same way. */
+#define BTN_SIZE      14         /* system-menu button square, in TITLE   */
+#define BTN_MARGIN     3         /* gap from the frame edge               */
+#define MENU_W       165         /* fits "Open editor (vim)" + margin     */
+#define MENU_ITEM_H   18
+#define MENU_MAXITEMS  4
+#define MENU_BG      0xEEEEF2u
+#define MENU_BORDER  0x8890A0u
+#define MENU_TX      0x101820u
 
-enum { MENU_ACT_CLOSE, MENU_ACT_TOBACK, MENU_NITEMS };
-static const char* const MENU_ITEMS[MENU_NITEMS] = { "Close", "Send to back" };
+enum { MENU_ACT_CLOSE, MENU_ACT_TOBACK, MENU_ACT_NEW_TERM,
+       MENU_ACT_EDITOR, MENU_ACT_NEW_ITEM };
 
 /* ------------------------------------------------------------------ *
  * A surface == one client window. The array order IS the z-order:     *
@@ -113,12 +117,17 @@ static int       s_mouse_ok  = 0;
 static int       s_drag_idx  = -1;   /* index into s_surf being dragged, or -1 */
 static int       s_drag_off_x, s_drag_off_y;  /* mouse offset from surface origin */
 
-/* titlebar system-menu: opened by clicking the corner button, closed by any
-   subsequent click (on an item, or anywhere else to dismiss). Tracked by
-   surface id rather than index since z-order can change while it's open. */
+/* Popup menu (system menu or desktop/window context menu): opened by a
+   click, closed by any subsequent click (on an item, or anywhere else to
+   dismiss). Tracked by surface id rather than index since z-order can
+   change while it's open; 0 means "no surface" (desktop, or the system
+   menu's owner -- there's always exactly one owner for that kind). */
 static int       s_menu_open    = 0;
 static uint32_t  s_menu_surf_id = 0;
 static int       s_menu_x, s_menu_y;
+static int          s_menu_nitems;
+static const char*  s_menu_label[MENU_MAXITEMS];
+static int          s_menu_act[MENU_MAXITEMS];
 
 /* raw-scancode keyboard decoding (opt-in via -k, see kbd.h). Off by default
    -- K_XLATE already handles plain typing/arrows/F-keys correctly; K_CODE is
@@ -260,6 +269,52 @@ static int titlebar_btn_hit(const surface_t* s, int mx, int my) {
 	return mx >= bx && mx < bx + BTN_SIZE && my >= by && my < by + BTN_SIZE;
 }
 
+/* defined near main(): forks `cmd` via /bin/sh -c as a new client */
+static void spawn_client(const char* cmd);
+
+/* Open the per-window system menu, anchored under its titlebar button. */
+static void open_sys_menu(surface_t* s) {
+	int bx, by;
+	titlebar_btn_rect(s, &bx, &by);
+	s_menu_surf_id = s->id;
+	s_menu_nitems  = 0;
+	s_menu_label[s_menu_nitems] = "Close";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_CLOSE;
+	s_menu_label[s_menu_nitems] = "Send to back";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_TOBACK;
+	s_menu_x = bx + BTN_SIZE - MENU_W;
+	if (s_menu_x < 0) s_menu_x = 0;
+	s_menu_y = by + BTN_SIZE + 2;
+	s_menu_open = 1;
+}
+
+/* Open the desktop/window context menu (RMB) at the pointer. hit_idx is the
+   surface under the pointer (surface_at()'s result), or -1 for bare desktop
+   -- "Close" only appears when a window was actually hit. */
+static void open_desktop_menu(int mx, int my, int hit_idx) {
+	s_menu_surf_id = (hit_idx >= 0) ? s_surf[hit_idx].id : 0;
+	s_menu_nitems  = 0;
+	s_menu_label[s_menu_nitems] = "New terminal";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_NEW_TERM;
+	if (hit_idx >= 0) {
+		s_menu_label[s_menu_nitems] = "Close";
+		s_menu_act[s_menu_nitems++] = MENU_ACT_CLOSE;
+	}
+	s_menu_label[s_menu_nitems] = "Open editor (vim)";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_EDITOR;
+	s_menu_label[s_menu_nitems] = "New item";
+	s_menu_act[s_menu_nitems++] = MENU_ACT_NEW_ITEM;
+
+	s_menu_x = mx;
+	s_menu_y = my;
+	if (s_menu_x + MENU_W > g_w) s_menu_x = g_w - MENU_W;
+	if (s_menu_y + s_menu_nitems * MENU_ITEM_H > g_h)
+		s_menu_y = g_h - s_menu_nitems * MENU_ITEM_H;
+	if (s_menu_x < 0) s_menu_x = 0;
+	if (s_menu_y < 0) s_menu_y = 0;
+	s_menu_open = 1;
+}
+
 /* Simple 12x16 arrow pointer, drawn with a 1px black outline so it stays
    visible over any background, white fill. Hotspot is the top-left pixel. */
 static void draw_cursor(int mx, int my) {
@@ -319,22 +374,22 @@ static void composite(void) {
 	}
 
 	if (s_menu_open) {
-		int i, found = 0;
-		for (i = 0; i < s_nsurf; i++)
-			if (s_surf[i].id == s_menu_surf_id) { found = 1; break; }
+		int i, found = (s_menu_surf_id == 0);   /* 0 == desktop, always valid */
+		for (i = 0; !found && i < s_nsurf; i++)
+			if (s_surf[i].id == s_menu_surf_id) found = 1;
 		if (!found) {
 			s_menu_open = 0;          /* its surface closed itself meanwhile */
 		} else {
-			int mh = MENU_NITEMS * MENU_ITEM_H;
+			int mh = s_menu_nitems * MENU_ITEM_H;
 			fill_rect(s_menu_x, s_menu_y, MENU_W, mh, MENU_BG);
 			fill_rect(s_menu_x, s_menu_y, MENU_W, 1, MENU_BORDER);
 			fill_rect(s_menu_x, s_menu_y + mh - 1, MENU_W, 1, MENU_BORDER);
 			fill_rect(s_menu_x, s_menu_y, 1, mh, MENU_BORDER);
 			fill_rect(s_menu_x + MENU_W - 1, s_menu_y, 1, mh, MENU_BORDER);
-			for (i = 0; i < MENU_NITEMS; i++)
+			for (i = 0; i < s_menu_nitems; i++)
 				draw_string(s_menu_x + 8,
 				            s_menu_y + i * MENU_ITEM_H + (MENU_ITEM_H - GLYPH_H) / 2,
-				            MENU_ITEMS[i], MENU_TX);
+				            s_menu_label[i], MENU_TX);
 		}
 	}
 
@@ -589,24 +644,38 @@ static int handle_mouse(int prev_buttons) {
 	if (pressed & MOUSE_BTN_LEFT) {
 		int consumed = 0;
 
-		/* an open system menu eats the next left click: either it hit an
-		   item (act on it) or it didn't (just dismiss, then fall through to
-		   ordinary click handling below for whatever's under the pointer) */
+		/* an open menu eats the next left click: either it hit an item (act
+		   on it) or it didn't (just dismiss, then fall through to ordinary
+		   click handling below for whatever's under the pointer) */
 		if (s_menu_open) {
-			int mh = MENU_NITEMS * MENU_ITEM_H;
+			int mh = s_menu_nitems * MENU_ITEM_H;
 			s_menu_open = 0;
 			if (s_mouse.x >= s_menu_x && s_mouse.x < s_menu_x + MENU_W &&
 			    s_mouse.y >= s_menu_y && s_mouse.y < s_menu_y + mh) {
 				int item = (s_mouse.y - s_menu_y) / MENU_ITEM_H;
-				int i;
-				for (i = 0; i < s_nsurf; i++)
-					if (s_surf[i].id == s_menu_surf_id)
+				if (item >= 0 && item < s_menu_nitems) {
+					int act = s_menu_act[item];
+					int i, idx = -1;
+					if (s_menu_surf_id != 0)
+						for (i = 0; i < s_nsurf; i++)
+							if (s_surf[i].id == s_menu_surf_id) { idx = i; break; }
+					switch (act) {
+					case MENU_ACT_CLOSE:
+						if (idx >= 0) surface_request_close(&s_surf[idx]);
 						break;
-				if (i < s_nsurf) {
-					if (item == MENU_ACT_CLOSE)
-						surface_request_close(&s_surf[i]);
-					else if (item == MENU_ACT_TOBACK)
-						surface_lower(i);
+					case MENU_ACT_TOBACK:
+						if (idx >= 0) surface_lower(idx);
+						break;
+					case MENU_ACT_NEW_TERM:
+						spawn_client("./term");
+						break;
+					case MENU_ACT_EDITOR:
+						spawn_client("TERM_CMD=vim ./term");
+						break;
+					case MENU_ACT_NEW_ITEM:
+					default:
+						break;          /* placeholder, intentionally no-op */
+					}
 				}
 				consumed = 1;
 			}
@@ -620,13 +689,7 @@ static int handle_mouse(int prev_buttons) {
 				if (titlebar) {
 					surface_t* s = &s_surf[s_nsurf - 1];
 					if (titlebar_btn_hit(s, s_mouse.x, s_mouse.y)) {
-						int bx, by;
-						titlebar_btn_rect(s, &bx, &by);
-						s_menu_open    = 1;
-						s_menu_surf_id = s->id;
-						s_menu_x       = bx + BTN_SIZE - MENU_W;
-						if (s_menu_x < 0) s_menu_x = 0;
-						s_menu_y       = by + BTN_SIZE + 2;
+						open_sys_menu(s);
 					} else {
 						s_drag_idx   = s_nsurf - 1;
 						s_drag_off_x = s_mouse.x - s->x;
@@ -638,6 +701,12 @@ static int handle_mouse(int prev_buttons) {
 	}
 	if (!(s_mouse.buttons & MOUSE_BTN_LEFT))
 		s_drag_idx = -1;
+
+	if (pressed & MOUSE_BTN_RIGHT) {
+		int titlebar = 0;      /* unused here, but surface_at() needs it */
+		int hit = surface_at(s_mouse.x, s_mouse.y, &titlebar);
+		open_desktop_menu(s_mouse.x, s_mouse.y, hit);
+	}
 
 	if (s_drag_idx >= 0) {
 		surface_t* s = &s_surf[s_drag_idx];

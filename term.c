@@ -932,13 +932,19 @@ static int spawn_shell(term_t* t) {
 	pid = forkpty(&master, NULL, NULL, &ws);
 	if (pid < 0)
 		return -1;
-	if (pid == 0) {                       /* child: the shell */
-		const char* sh = getenv("SHELL");
-		if (sh == NULL || *sh == '\0') sh = "/bin/sh";
+	if (pid == 0) {                       /* child: the shell (or $TERM_CMD) */
+		const char* cmd = getenv("TERM_CMD");
 		setenv("TERM", "xterm-256color", 1);
 		unsetenv("LINES");
 		unsetenv("COLUMNS");
-		execl(sh, sh, "-i", (char*)NULL);
+		if (cmd != NULL && *cmd != '\0') {
+			unsetenv("TERM_CMD");
+			execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+		} else {
+			const char* sh = getenv("SHELL");
+			if (sh == NULL || *sh == '\0') sh = "/bin/sh";
+			execl(sh, sh, "-i", (char*)NULL);
+		}
 		_exit(127);
 	}
 
