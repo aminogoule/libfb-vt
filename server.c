@@ -724,6 +724,7 @@ int main(int argc, char* argv[]) {
 	}
 	s_kbd_debug = (getenv("KBD_DEBUG") != NULL);
 	s_mouse_debug = (getenv("MOUSE_DEBUG") != NULL);
+	mouse_debug   = s_mouse_debug;
 
 	signal(SIGPIPE, SIG_IGN);            /* dead-client writes => EPIPE  */
 	signal(SIGCHLD, SIG_IGN);            /* auto-reap spawned clients    */

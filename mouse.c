@@ -33,6 +33,9 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
+
+int mouse_debug = 0;
 
 int mouse_open(mouse_t* m, const char* dev) {
 	int level;
@@ -141,6 +144,13 @@ int mouse_poll(mouse_t* m) {
 			}
 			m->pkt[m->nbytes++] = b;
 			if (m->nbytes >= m->pktlen) {
+				if (mouse_debug) {
+					int k;
+					fprintf(stderr, "pkt:");
+					for (k = 0; k < m->pktlen; k++)
+						fprintf(stderr, " %02x", m->pkt[k]);
+					fprintf(stderr, "\n");
+				}
 				if (apply_packet(m))
 					changed = 1;
 				m->nbytes = 0;
