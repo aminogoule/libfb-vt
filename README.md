@@ -10,9 +10,20 @@
 - `ppm.c` / `ppm.h`   — загрузчик PPM (P6/P3, комментарии, любой maxval) + 32bpp blit/cls.
 - `vtcon.c` / `vtcon.h` — нативное владение VT/консолью: захват через `VT_OPENQRY`, `KD_GRAPHICS`
   и рукопожатие переключения `VT_SETMODE(VT_PROCESS)` (тот же механизм, что использует X).
-- `mouse.c` / `mouse.h` — курсор мыши: читает `/dev/sysmouse` (нужен запущенный `moused(8)`),
-  декодирует относительные dx/dy/колесо/кнопки в протоколе sysmouse (уровень 1, 8 байт, с
-  откатом на уровень 0), копит абсолютную позицию с клипом по экрану.
+- `mouse.c` / `mouse.h` — курсор мыши: два взаимозаменяемых бэкенда, выбираемых на этапе
+  компиляции по архитектуре CPU (единый публичный интерфейс, `server.c` не знает, какой
+  собран):
+  - **sysmouse** (по умолчанию на x86/amd64) — читает `/dev/sysmouse` (нужен запущенный
+    `moused(8)`), декодирует относительные dx/dy/колесо/кнопки в протоколе sysmouse
+    (уровень 1, 8 байт, с откатом на уровень 0);
+  - **evdev** (по умолчанию на arm64, `__aarch64__`) — читает поток `struct input_event`
+    из `/dev/input/eventN` (по умолчанию `/dev/input/event3`): `EV_REL` (движение + колесо),
+    `EV_KEY` (кнопки), клип по `EV_SYN`/`SYN_REPORT`.
+
+  Любой бэкенд можно навязать независимо от архитектуры: `-DMOUSE_BACKEND_EVDEV` или
+  `-DMOUSE_BACKEND_SYSMOUSE`. Устройство evdev по умолчанию переопределяется через
+  `-DMOUSE_EVDEV_DEFAULT='"/dev/input/eventN"'`. Оба бэкенда копят абсолютную позицию с
+  клипом по экрану.
 - `kbd.c` / `kbd.h` — декодер сырых скан-кодов клавиатуры (`K_CODE`, AT/PS2 set 1) с
   реальным состоянием Shift/Ctrl/Alt — опционально (`server -k`), нужен только для комбинаций
   вроде Shift+стрелка, которые `K_XLATE` не может выразить (см. раздел «Клавиатура» ниже).
@@ -73,9 +84,10 @@
 
 ### Мышь
 
-При старте компоновщик пытается открыть `/dev/sysmouse` (нужен запущенный `moused(8)`,
-например `moused -p /dev/psm0 -t auto`); если устройство недоступно, сервер просто
-работает без указателя — клавиатура не страдает. Когда мышь есть:
+При старте компоновщик пытается открыть устройство указателя: на x86/amd64 это
+`/dev/sysmouse` (нужен запущенный `moused(8)`, например `moused -p /dev/psm0 -t auto`),
+на **arm64** — `/dev/input/event3` через evdev (см. `mouse.c`). Если устройство недоступно,
+сервер просто работает без указателя — клавиатура не страдает. Когда мышь есть:
 
 - курсор рисуется поверх композиции (стрелка с чёрной окантовкой);
 - клик по окну поднимает его наверх и делает сфокусированным;
@@ -198,43 +210,62 @@ xterm (нет модификаторов клавиш, bracketed paste и т.п.
 
 ---
 
-## Бэкенды (добавлено): vt_fb / vt_vga / VMware SVGA II
+## Бэкенды (добавлено): vt_fb / vt_vga / VMware SVGA II / SVGA3
 
-Слой framebuffer теперь имеет три взаимозаменяемых бэкенда за одним и тем же
-API `fb.h`. Выбирайте по одному на бинарник; Makefile собирает все три с суффиксами:
+Слой framebuffer теперь имеет четыре взаимозаменяемых бэкенда за одним и тем же
+API `fb.h`. Выбирайте по одному на бинарник; Makefile собирает все с суффиксами:
 
-| Бэкенд     | Исходник    | Консоль / железо       | Путь к пикселям                         |
-|------------|-------------|------------------------|-----------------------------------------|
-| `.fb`      | `fb.c`      | vt_fb / scfb / KMS (vtfb0) | `FBIOGTYPE` + `mmap` с tty          |
-| `.vga`     | `fb_vga.c`  | vt_vga (vtvga0)        | `/dev/mem` 0xA0000 + `/dev/io` (планарный 12h) |
-| `.svga`    | `fb_svga.c` | VMware SVGA II (15ad:0405) | `/dev/pci` + `/dev/io` + `/dev/mem` (линейный + FIFO 2D) |
+| Бэкенд     | Исходник     | Консоль / железо       | Путь к пикселям                         |
+|------------|--------------|------------------------|-----------------------------------------|
+| `.fb`      | `fb.c`       | vt_fb / scfb / KMS (vtfb0) | `FBIOGTYPE` + `mmap` с tty          |
+| `.vga`     | `fb_vga.c`   | vt_vga (vtvga0)        | `/dev/mem` 0xA0000 + `/dev/io` (планарный 12h) |
+| `.svga`    | `fb_svga.c`  | VMware SVGA II (15ad:0405) | `/dev/pci` + `/dev/io` + `/dev/mem` (линейный + FIFO 2D) |
+| `.svga3`   | `fb_svga3.c` | VMware SVGA3 (15ad:0406) | `/dev/pci` + `/dev/mem` (линейный, регистры в MMIO) |
 
 Какой из них вам нужен:
 
     sysctl kern.vty                 # должно быть 'vt'
     dmesg | grep -E 'VT\(|vgapci'   # VT(vga)=vtvga0, VT(efifb)/fb=vtfb0
-    pciconf -lv | grep -i vmware    # 15ad:0405 => SVGA II присутствует
+    pciconf -lv | grep -i vmware    # 15ad:0405 => SVGA II, 15ad:0406 => SVGA3
 
 - **vtfb0** (линейная консоль уже присутствует) -> `.fb`, самый простой, без привилегий
   сверх открытия tty.
 - **vtvga0** (`VT(vga)`) -> `.vga`. Замечание: если консоль `VT(vga): text 80x25`,
   карта находится в VGA *текстовом* режиме; `fb_vga.c` предполагает, что она переведена
   в графический режим 12h. На VMware предпочтительнее путь SVGA ниже.
-- **VMware SVGA II** -> `.svga`: полноценный линейный 32bpp framebuffer любого разрешения
-  плюс аппаратный 2D (`RECT_COPY`/`RECT_FILL`, когда устройство объявляет возможности,
-  иначе программный fallback), без X, без DRM/KMS, без vmwgfx.
+- **VMware SVGA II** (`15ad:0405`) -> `.svga`: полноценный линейный 32bpp framebuffer
+  любого разрешения плюс аппаратный 2D (`RECT_COPY`/`RECT_FILL`, когда устройство
+  объявляет возможности, иначе программный fallback), без X, без DRM/KMS, без vmwgfx.
+- **VMware SVGA3** (`15ad:0406`) -> `.svga3`: поколение с регистрами в MMIO (то, что
+  VMware Fusion отдаёт гостям **arm64** / UEFI). Отличия от SVGA II, из-за которых нужен
+  отдельный бэкенд:
+  - **нет I/O-портов** — регистры отображены в BAR0 (индекс `i` = слово по смещению `i*4`),
+    поэтому `/dev/io` не нужен и бэкенд **архитектурно-независим** (собирается и на arm64);
+  - **нет легаси-FIFO** — 2D и present идут через **command buffers**: 64-байтный
+    `SVGACBHeader` + поток команд размещаются в хвосте VRAM (физадрес известен, устройство
+    читает DMA), при открытии включается контекст 0, физадрес заголовка пишется в
+    `SVGA_REG_COMMAND_LOW/HIGH`. Через это: present — `SVGA_CMD_UPDATE` (dirty-rect), а
+    `fb_svga_copy` — аппаратный `SVGA_CMD_RECT_COPY` (гейтится `SVGA_CAP_RECT_COPY`;
+    идеально для скролла/перетаскивания окон). HW-команды сплошной заливки у SVGA нет,
+    поэтому `fb_svga_fill` — программная заливка + present. Если `SVGA_CAP_COMMAND_BUFFERS`
+    нет или сабмит не прошёл — откат на «пинок» `SVGA_REG_SYNC` для present и программный
+    copy. При выходе контекст 0 останавливается, исходный режим регистров восстанавливается,
+    чтобы вернулась консоль (у SVGA3 нет VGA-текстовой эмуляции);
+  - BAR0 = регистры, **BAR2 = VRAM** (у SVGA II было BAR1/BAR2), базы и длины берутся
+    через `PCIOCGETBAR` (корректно и для 64-битных BAR).
 
 ### Сборка
 
-    make            # все три бэкенда
-    make svga       # только бинарники VMware SVGA II
-    sudo ./server.svga ./test.ppm
+    make            # все бэкенды
+    make svga       # только бинарники VMware SVGA II  (15ad:0405)
+    make svga3      # только бинарники VMware SVGA3     (15ad:0406)
+    sudo ./server.svga3 ./test.ppm
 
 ### Требования
 
-Все бэкенды: root, на консоли `vt(4)`. `.vga` и `.svga` дополнительно требуют
+Все бэкенды: root, на консоли `vt(4)`. `.vga`, `.svga`, `.svga3` дополнительно требуют
 `kern.securelevel <= 0` (доступный на запись `/dev/mem`). `.svga` использует `/dev/pci`,
-`/dev/io`, `/dev/mem`.
+`/dev/io`, `/dev/mem`; `.svga3` — `/dev/pci` и `/dev/mem` (без `/dev/io`).
 
 ### Переключение VT во время работы сервера
 
@@ -354,43 +385,59 @@ Quit with `q` / ESC (or SIGINT/SIGTERM). `server` refuses VT switching
 
 ---
 
-## Backends (added): vt_fb / vt_vga / VMware SVGA II
+## Backends (added): vt_fb / vt_vga / VMware SVGA II / SVGA3
 
-The framebuffer layer now has three interchangeable backends behind the same
-`fb.h` API. Pick one per binary; the Makefile builds all three, suffixed:
+The framebuffer layer now has four interchangeable backends behind the same
+`fb.h` API. Pick one per binary; the Makefile builds all of them, suffixed:
 
-| Backend    | Source      | Console / HW           | Path to pixels                          |
-|------------|-------------|------------------------|-----------------------------------------|
-| `.fb`      | `fb.c`      | vt_fb / scfb / KMS (vtfb0) | `FBIOGTYPE` + `mmap` off the tty     |
-| `.vga`     | `fb_vga.c`  | vt_vga (vtvga0)        | `/dev/mem` 0xA0000 + `/dev/io` (planar 12h) |
-| `.svga`    | `fb_svga.c` | VMware SVGA II (15ad:0405) | `/dev/pci` + `/dev/io` + `/dev/mem` (linear + FIFO 2D) |
+| Backend    | Source       | Console / HW           | Path to pixels                          |
+|------------|--------------|------------------------|-----------------------------------------|
+| `.fb`      | `fb.c`       | vt_fb / scfb / KMS (vtfb0) | `FBIOGTYPE` + `mmap` off the tty     |
+| `.vga`     | `fb_vga.c`   | vt_vga (vtvga0)        | `/dev/mem` 0xA0000 + `/dev/io` (planar 12h) |
+| `.svga`    | `fb_svga.c`  | VMware SVGA II (15ad:0405) | `/dev/pci` + `/dev/io` + `/dev/mem` (linear + FIFO 2D) |
+| `.svga3`   | `fb_svga3.c` | VMware SVGA3 (15ad:0406) | `/dev/pci` + `/dev/mem` (linear, MMIO registers) |
 
 Which one you need:
 
     sysctl kern.vty                 # must be 'vt'
     dmesg | grep -E 'VT\(|vgapci'   # VT(vga)=vtvga0, VT(efifb)/fb=vtfb0
-    pciconf -lv | grep -i vmware    # 15ad:0405 => SVGA II present
+    pciconf -lv | grep -i vmware    # 15ad:0405 => SVGA II, 15ad:0406 => SVGA3
 
 - **vtfb0** (linear console already present) -> `.fb`, simplest, no privileges
   beyond opening the tty.
 - **vtvga0** (`VT(vga)`) -> `.vga`. Note: if the console is `VT(vga): text 80x25`
   the card is in VGA *text* mode; `fb_vga.c` assumes it has been put into 12h
   graphics. On VMware, prefer the SVGA path below instead.
-- **VMware SVGA II** -> `.svga`: full linear 32bpp framebuffer at any resolution
-  plus hardware 2D (`RECT_COPY`/`RECT_FILL` when the device advertises the caps,
-  software fallback otherwise), with no X, no DRM/KMS, no vmwgfx.
+- **VMware SVGA II** (`15ad:0405`) -> `.svga`: full linear 32bpp framebuffer at
+  any resolution plus hardware 2D (`RECT_COPY`/`RECT_FILL` when the device
+  advertises the caps, software fallback otherwise), no X, no DRM/KMS, no vmwgfx.
+- **VMware SVGA3** (`15ad:0406`) -> `.svga3`: the register-MMIO generation (what
+  VMware Fusion gives **arm64** / UEFI guests). Why it needs its own backend:
+  - **no I/O ports** — registers live in BAR0 (index `i` = word at byte `i*4`), so
+    no `/dev/io` and the backend is **architecture-independent** (builds on arm64);
+  - **no legacy FIFO** — 2D and present go through **command buffers**: a 64-byte
+    `SVGACBHeader` + command stream placed in the VRAM tail (physical address known,
+    device DMAs it), context 0 started at open, header PA poked into
+    `SVGA_REG_COMMAND_LOW/HIGH`. Present is `SVGA_CMD_UPDATE` (dirty-rect) and
+    `fb_svga_copy` is hardware `SVGA_CMD_RECT_COPY` (gated on `SVGA_CAP_RECT_COPY`;
+    ideal for scroll / window drag). SVGA has no HW solid-fill, so `fb_svga_fill` is
+    a software fill + present. No `SVGA_CAP_COMMAND_BUFFERS` (or a failed submit) →
+    fall back to a `SVGA_REG_SYNC` poke for present and software copy;
+  - BAR0 = registers, **BAR2 = VRAM** (SVGA II used BAR1/BAR2); bases and lengths
+    come from `PCIOCGETBAR` (64-bit-BAR safe).
 
 ### Build
 
-    make            # all three backends
-    make svga       # just the VMware SVGA II binaries
-    sudo ./server.svga ./test.ppm
+    make            # all backends
+    make svga       # just the VMware SVGA II binaries  (15ad:0405)
+    make svga3      # just the VMware SVGA3 binaries     (15ad:0406)
+    sudo ./server.svga3 ./test.ppm
 
 ### Requirements
 
-All backends: root, on a `vt(4)` console. `.vga` and `.svga` additionally need
-`kern.securelevel <= 0` (writable `/dev/mem`). `.svga` uses `/dev/pci`, `/dev/io`,
-`/dev/mem`.
+All backends: root, on a `vt(4)` console. `.vga`, `.svga`, `.svga3` additionally
+need `kern.securelevel <= 0` (writable `/dev/mem`). `.svga` uses `/dev/pci`,
+`/dev/io`, `/dev/mem`; `.svga3` uses `/dev/pci` and `/dev/mem` (no `/dev/io`).
 
 ### VT switching while the server runs
 

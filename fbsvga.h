@@ -2,14 +2,19 @@
 #define FBSVGA_H
 
 /*
- * fbsvga.h -- VMware SVGA II specific extensions on top of the fb.h API.
+ * fbsvga.h -- VMware SVGA specific extensions on top of the fb.h API.
  *
- * fb_svga.c also implements the plain fb.h entry points (fb_open/fb_close/
- * fb_drawbuf/fb_pitch/fb_flip), so ppm.c / server.c / ppm2fb.c build against
- * it unchanged. fb_open() picks a default mode; use fb_svga_open() for control.
+ * Implemented by two interchangeable backends behind an identical interface:
+ *   - fb_svga.c   -- VMware SVGA II  (15ad:0405): I/O-port registers + FIFO 2D.
+ *   - fb_svga3.c  -- VMware SVGA3    (15ad:0406): MMIO registers, no FIFO, so
+ *                    software-only fill/copy and a no-op update (the device
+ *                    scans out VRAM continuously). Builds on arm64 too.
+ * Both also implement the plain fb.h entry points (fb_open/fb_close/fb_drawbuf/
+ * fb_pitch/fb_flip), so ppm.c / server.c / ppm2fb.c build against either
+ * unchanged. fb_open() picks a default mode; use fb_svga_open() for control.
  *
- * These extras expose what a linear-FB-with-2D display server actually needs
- * on VMware SVGA II, with NO X, NO DRM/KMS, NO vmwgfx:
+ * These extras expose what a linear-FB display server actually needs on VMware
+ * SVGA, with NO X, NO DRM/KMS, NO vmwgfx:
  *   - explicit mode set (width/height/bpp)
  *   - enable/disable the SVGA scanout (hand the screen back to vt(4) text)
  *   - hardware 2D via the FIFO (RECT_COPY / RECT_FILL where the device

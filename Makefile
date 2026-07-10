@@ -36,14 +36,17 @@ PROG_SRC_TERM=		term.c proto.c
 
 HDRS=		fb.h ppm.h vtcon.h fbsvga.h mouse.h kbd.h proto.h fontspleen.h
 
+# fb_svga3.c uses no port I/O, so it also builds on arm64 (the usual SVGA3 case).
+
 # term is a display-server *client*: it links no framebuffer backend (it only
 # talks the socket protocol + drives a pty), so it is one backend-independent
 # binary, built alongside every backend group.
-all: svga vga fb term
+all: svga svga3 vga fb term
 
-svga: ppm2fb.svga fbshow.svga server.svga cube.svga
-vga:  ppm2fb.vga  fbshow.vga  server.vga  cube.vga
-fb:   ppm2fb.fb   fbshow.fb    server.fb   cube.fb
+svga:  ppm2fb.svga  fbshow.svga  server.svga  cube.svga
+svga3: ppm2fb.svga3 fbshow.svga3 server.svga3 cube.svga3
+vga:   ppm2fb.vga   fbshow.vga    server.vga   cube.vga
+fb:    ppm2fb.fb    fbshow.fb     server.fb    cube.fb
 
 # ---- terminal client (backend-independent) --------------------------
 term: $(PROG_SRC_TERM) proto.h fontspleen.h
@@ -58,6 +61,16 @@ server.svga: $(PROG_SRC_SERVER) fb_svga.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_SERVER) fb_svga.c
 cube.svga: $(PROG_SRC_CUBE) fb_svga.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb_svga.c $(LIBM)
+
+# ---- VMware SVGA3 (15ad:0406, register MMIO, no port I/O) ------------
+ppm2fb.svga3: $(PROG_SRC_PPM2FB) fb_svga3.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_PPM2FB) fb_svga3.c
+fbshow.svga3: $(PROG_SRC_FBSHOW) fb_svga3.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_FBSHOW) fb_svga3.c
+server.svga3: $(PROG_SRC_SERVER) fb_svga3.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_SERVER) fb_svga3.c
+cube.svga3: $(PROG_SRC_CUBE) fb_svga3.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb_svga3.c $(LIBM)
 
 # ---- planar VGA (vtvga0) --------------------------------------------
 ppm2fb.vga: $(PROG_SRC_PPM2FB) fb_vga.c $(HDRS)
@@ -80,11 +93,11 @@ cube.fb: $(PROG_SRC_CUBE) fb.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb.c $(LIBM)
 
 clean:
-	rm -f ppm2fb.fb ppm2fb.vga ppm2fb.svga \
-	      fbshow.fb fbshow.vga fbshow.svga \
-	      server.fb server.vga server.svga \
-	      cube.fb   cube.vga   cube.svga \
+	rm -f ppm2fb.fb ppm2fb.vga ppm2fb.svga ppm2fb.svga3 \
+	      fbshow.fb fbshow.vga fbshow.svga fbshow.svga3 \
+	      server.fb server.vga server.svga server.svga3 \
+	      cube.fb   cube.vga   cube.svga   cube.svga3 \
 	      term \
 	      *.o
 
-.PHONY: all svga vga fb clean
+.PHONY: all svga svga3 vga fb clean

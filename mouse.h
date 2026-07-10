@@ -2,21 +2,26 @@
 #define MOUSE_H
 
 /*
- * mouse -- FreeBSD /dev/sysmouse reader.
+ * mouse -- relative-pointer reader with two interchangeable backends,
+ * selected at compile time by CPU architecture (see mouse.c):
  *
- * moused(8) translates whatever pointing device is attached (PS/2, USB, ...)
- * into the "sysmouse" protocol and republishes it on /dev/sysmouse, so every
- * consumer (X, the console, us) shares one relative-motion stream regardless
- * of the underlying hardware. We open that device directly: no /dev/psm0, no
- * /dev/mem.
+ *   sysmouse  (x86 / amd64 default) -- moused(8) republishes whatever
+ *       pointing device is attached (PS/2, USB, ...) as the "sysmouse"
+ *       protocol on /dev/sysmouse, so every consumer shares one stream. We
+ *       ask for MOUSE_SETLEVEL 1 (8-byte packets: dx, dy, buttons, dz),
+ *       falling back to level 0 (5-byte, no wheel) if the driver refuses.
  *
- * The kernel supports two sysmouse packet sizes, chosen with MOUSE_SETLEVEL:
- *   level 0 -- 5 bytes: dx, dy, 3 buttons        (MOUSE_MSC_PACKETSIZE)
- *   level 1 -- 8 bytes: dx, dy, 3 buttons, dz     (MOUSE_SYS_PACKETSIZE)
- * We ask for level 1 so wheel motion is available; if the driver refuses
- * (or moused isn't running that way) level 0 still works, we just don't get
- * dz. Buttons 4-7 (MOUSE_SYS_EXTBUTTONS) are not decoded -- out of scope for
- * this seed.
+ *   evdev     (arm64 default) -- arm64 boards expose the pointer through the
+ *       evdev interface as a stream of struct input_event records on
+ *       /dev/input/eventN (default /dev/input/event3). We decode EV_REL
+ *       (motion + wheel), EV_KEY (buttons) and clamp on EV_SYN/SYN_REPORT.
+ *
+ * Either backend can be forced regardless of arch with -DMOUSE_BACKEND_EVDEV
+ * or -DMOUSE_BACKEND_SYSMOUSE. Buttons 4-7 are not decoded on either path --
+ * out of scope for this seed.
+ *
+ * The public interface below is identical for both backends, so consumers
+ * (server.c) never learn which one is compiled in.
  */
 
 #include <stdint.h>
@@ -27,11 +32,19 @@
 
 typedef struct {
 	int fd;
+
+	/* sysmouse backend: in-progress packet reassembly */
 	int level;             /* 0 or 1, whichever MOUSE_SETLEVEL accepted */
 	int pktlen;             /* 5 or 8, matching level                    */
 	int syncmask, syncval;  /* sync-byte check, matching level           */
 	unsigned char pkt[8];
 	int nbytes;             /* bytes of the in-progress packet collected */
+
+	/* evdev backend: carry for a struct input_event record split across
+	   two reads (kernel returns whole records, but a short non-blocking
+	   read can still leave a tail); 32 >= sizeof(struct input_event). */
+	unsigned char rawbuf[32];
+	int rawlen;
 
 	int buttons;            /* live bitmask, MOUSE_BTN_*                 */
 	int x, y;                /* accumulated absolute position, clamped   */
@@ -40,8 +53,10 @@ typedef struct {
 	                          /* mouse_poll() call (reset on entry to it) */
 } mouse_t;
 
-/* Open dev (NULL => "/dev/sysmouse"), non-blocking. Returns 0/-1 (errno set).
-   Safe to treat failure as "no mouse available" and carry on without one. */
+/* Open dev, non-blocking; NULL => the compiled-in backend's default device
+   ("/dev/sysmouse" for sysmouse, "/dev/input/event3" for evdev). Returns
+   0/-1 (errno set). Safe to treat failure as "no mouse available" and carry
+   on without one. */
 int mouse_open(mouse_t* m, const char* dev);
 
 /* Screen bounds (inclusive) for absolute-position clamping. Call once you
