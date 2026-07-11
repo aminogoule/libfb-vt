@@ -114,6 +114,12 @@ typedef struct {
 	int       saved_cx, saved_cy;
 	int       scroll_top, scroll_bot;  /* DECSTBM margins, 0-based inclusive */
 	int       app_cursor_keys;         /* DECCKM: 1 => arrows report ESC O x */
+	int       insert_mode;             /* IRM (CSI 4h/4l, no '?'): 1 => put_char
+	                                       shifts the row right instead of
+	                                       overwriting -- readline/libedit
+	                                       toggle this per character instead
+	                                       of using ICH (see csi_exec's 'h'/'l'
+	                                       and put_char) */
 
 	/* scrollback: lines pushed off the top of the primary screen (see
 	   region_scroll_up), viewable with the mouse wheel when the foreground
@@ -294,6 +300,8 @@ static void put_char(term_t* t, uint32_t cp) {
 		t->cx = 0;
 		newline(t);
 	}
+	if (t->insert_mode)
+		line_insert_chars(t, t->cy, t->cx, 1);
 	c = &t->grid[t->cy * t->cols + t->cx];
 	c->cp = cp;
 	c->fg = t->reverse ? t->cur_bg : t->cur_fg;
@@ -448,8 +456,14 @@ static void csi_exec(term_t* t, unsigned char final) {
 		}
 		break;
 	}
-	case 'h': if (t->priv) dec_mode(t, 1); break;
-	case 'l': if (t->priv) dec_mode(t, 0); break;
+	case 'h':                              /* SM: ANSI mode set */
+		if (t->priv) dec_mode(t, 1);
+		else if (param(t, 0, 0) == 4) t->insert_mode = 1;   /* IRM */
+		break;
+	case 'l':                              /* RM: ANSI mode reset */
+		if (t->priv) dec_mode(t, 0);
+		else if (param(t, 0, 0) == 4) t->insert_mode = 0;   /* IRM */
+		break;
 	case 's': t->saved_cx = t->cx; t->saved_cy = t->cy; break;
 	case 'u': t->cx = t->saved_cx; t->cy = t->saved_cy; break;
 	case 'm': sgr(t); break;
@@ -576,6 +590,7 @@ static void feed(term_t* t, unsigned char ch) {
 			t->grid = t->primary_grid; t->alt_active = 0;
 			grid_clear(t);
 			t->scroll_top = 0; t->scroll_bot = t->rows - 1;
+			t->insert_mode = 0;
 			t->state = S_NORM; break;
 		default: t->state = S_NORM; break;
 		}
