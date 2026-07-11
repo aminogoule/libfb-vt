@@ -618,10 +618,28 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 	int i;
 
 	if (t->mouse_mode == 0) {
-		/* the foreground app hasn't grabbed the mouse (e.g. a plain shell
-		   prompt): use the wheel to browse scrollback instead of forwarding
-		   it anywhere. 3 lines/click matches common terminal defaults. */
-		if (dz != 0) {
+		if (t->alt_active) {
+			/* an alt-screen app (vim, less, mc without mouse support...)
+			   owns the display but hasn't asked for mouse reporting -- our
+			   own scrollback is not it (region_scroll_up never pushes into
+			   it while alt_active, see there), so adjusting scroll_offset
+			   here would browse stale primary-screen history underneath a
+			   display it doesn't belong to. Do what real terminals do
+			   (xterm's altSendsXtermScroll, iTerm2, gnome-terminal, ...):
+			   turn the wheel into Up/Down arrow keypresses, which is
+			   exactly what these apps use wheel-less scrolling for. */
+			if (dz != 0) {
+				int      lines = dz > 0 ? dz : -dz;
+				unsigned char seq[3] = { 0x1B,
+					(unsigned char)(t->app_cursor_keys ? 'O' : '['),
+					(unsigned char)(dz > 0 ? 'A' : 'B') };
+				for (i = 0; i < lines * 3; i++)   /* 3 lines/click, as below */
+					(void)write(t->pty, seq, sizeof(seq));
+			}
+		} else if (dz != 0) {
+			/* plain shell prompt on the primary screen: browse our own
+			   scrollback instead of forwarding the wheel anywhere. 3
+			   lines/click matches common terminal defaults. */
 			t->scroll_offset += dz * 3;
 			if (t->scroll_offset < 0) t->scroll_offset = 0;
 			if (t->scroll_offset > t->sb_count) t->scroll_offset = t->sb_count;
