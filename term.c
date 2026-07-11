@@ -629,12 +629,27 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 			   turn the wheel into Up/Down arrow keypresses, which is
 			   exactly what these apps use wheel-less scrolling for. */
 			if (dz != 0) {
+				/* Build the whole repeat-burst in one buffer and send it as
+				   a single write(). t->pty is O_NONBLOCK (see fcntl() near
+				   the pty setup below); a tty write is not guaranteed
+				   atomic, so N separate 3-byte write() calls risk one of
+				   them landing partially -- a torn ESC/'['/final byte then
+				   corrupts the framing of every escape sequence sent after
+				   it, which is exactly what made scrolling wedge for good
+				   once the wheel was spun hard (e.g. flicking all the way
+				   to the top of the buffer). One write() of a small, capped
+				   burst keeps this comfortably inside the pty's input queue
+				   so it can't be torn in practice. */
 				int      lines = dz > 0 ? dz : -dz;
-				unsigned char seq[3] = { 0x1B,
+				int      nrep  = lines * 3;          /* 3 lines/click */
+				unsigned char one[3] = { 0x1B,
 					(unsigned char)(t->app_cursor_keys ? 'O' : '['),
 					(unsigned char)(dz > 0 ? 'A' : 'B') };
-				for (i = 0; i < lines * 3; i++)   /* 3 lines/click, as below */
-					(void)write(t->pty, seq, sizeof(seq));
+				unsigned char buf[3 * 30];
+				if (nrep > 30) nrep = 30;
+				for (i = 0; i < nrep; i++)
+					memcpy(buf + i * 3, one, 3);
+				(void)write(t->pty, buf, (size_t)nrep * 3);
 			}
 		} else if (dz != 0) {
 			/* plain shell prompt on the primary screen: browse our own
