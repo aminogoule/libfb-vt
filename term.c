@@ -634,8 +634,13 @@ static void pty_write(term_t* t, const unsigned char* buf, size_t n) {
  * ------------------------------------------------------------------ */
 
 /* Encode and send one button/motion report. btn is the xterm button number
-   (0=left,1=middle,2=right,4=wheel-up,5=wheel-down); motion adds the xterm
-   "+32" convention for button-event-tracking drags. col/row are 0-based. */
+   (0=left,1=middle,2=right,64=wheel-up,65=wheel-down -- the wheel buttons
+   need the 0x40 bit set per the xterm mouse-reporting spec: a bare 4/5 has
+   no such bit and gets misread as an ordinary button 0/1 press with the
+   Shift modifier (Cb&4) instead of a wheel event, e.g. as <S-LeftMouse>/
+   <S-MiddleMouse> in vim -- see handle_mouse_msg's callers below); motion
+   adds the xterm "+32" convention for button-event-tracking drags. col/row
+   are 0-based. */
 static void report_button(term_t* t, int btn, int pressed, int motion,
                            int col, int row) {
 	char buf[32];
@@ -716,8 +721,8 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 	if (col < 0) col = 0;
 	if (row < 0) row = 0;
 
-	if (dz > 0) report_button(t, 4, 1, 0, col, row);   /* wheel up   */
-	if (dz < 0) report_button(t, 5, 1, 0, col, row);   /* wheel down */
+	if (dz > 0) report_button(t, 64, 1, 0, col, row);  /* wheel up   */
+	if (dz < 0) report_button(t, 65, 1, 0, col, row);  /* wheel down */
 
 	for (i = 0; i < 3; i++) {
 		if (changed & BTN_BIT[i])
