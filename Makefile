@@ -32,21 +32,28 @@ PROG_SRC_PPM2FB=	ppm2fb.c ppm.c
 PROG_SRC_FBSHOW=	fbshow.c ppm.c
 PROG_SRC_SERVER=	server.c vtcon.c mouse.c kbd.c proto.c ppm.c
 PROG_SRC_CUBE=		cube.c vtcon.c
+PROG_SRC_GLCUBE=	glcube.c vtcon.c mgl.c
 PROG_SRC_TERM=		term.c proto.c
+PROG_SRC_CUBEWIN=	cubewin.c proto.c mgl.c
 
-HDRS=		fb.h ppm.h vtcon.h fbsvga.h mouse.h kbd.h proto.h fontspleen.h
+HDRS=		fb.h ppm.h vtcon.h fbsvga.h mouse.h kbd.h proto.h fontspleen.h mgl.h
 
 # fb_svga3.c uses no port I/O, so it also builds on arm64 (the usual SVGA3 case).
 
-# term is a display-server *client*: it links no framebuffer backend (it only
-# talks the socket protocol + drives a pty), so it is one backend-independent
-# binary, built alongside every backend group.
-all: svga svga3 vga fb term
+# term and cubewin are display-server *clients*: they link no framebuffer
+# backend (they only talk the socket protocol, drawing into the shared
+# window buffer the compositor hands them), so each is one
+# backend-independent binary, built alongside every backend group.
+all: svga svga3 vga fb term cubewin
 
-svga:  ppm2fb.svga  fbshow.svga  server.svga  cube.svga
+# ---- windowed GL cube client (backend-independent, like term) -------
+cubewin: $(PROG_SRC_CUBEWIN) proto.h mgl.h
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBEWIN) $(LIBM)
+
+svga:  ppm2fb.svga  fbshow.svga  server.svga  cube.svga  glcube.svga
 svga3: ppm2fb.svga3 fbshow.svga3 server.svga3 cube.svga3
-vga:   ppm2fb.vga   fbshow.vga    server.vga   cube.vga
-fb:    ppm2fb.fb    fbshow.fb     server.fb    cube.fb
+vga:   ppm2fb.vga   fbshow.vga    server.vga   cube.vga  glcube.vga
+fb:    ppm2fb.fb    fbshow.fb     server.fb    cube.fb   glcube.fb
 
 # ---- terminal client (backend-independent) --------------------------
 term: $(PROG_SRC_TERM) proto.h fontspleen.h
@@ -61,6 +68,8 @@ server.svga: $(PROG_SRC_SERVER) fb_svga.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_SERVER) fb_svga.c
 cube.svga: $(PROG_SRC_CUBE) fb_svga.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb_svga.c $(LIBM)
+glcube.svga: $(PROG_SRC_GLCUBE) fb_svga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_GLCUBE) fb_svga.c $(LIBM)
 
 # ---- VMware SVGA3 (15ad:0406, register MMIO, no port I/O) ------------
 ppm2fb.svga3: $(PROG_SRC_PPM2FB) fb_svga3.c $(HDRS)
@@ -81,6 +90,8 @@ server.vga: $(PROG_SRC_SERVER) fb_vga.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_SERVER) fb_vga.c
 cube.vga: $(PROG_SRC_CUBE) fb_vga.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb_vga.c $(LIBM)
+glcube.vga: $(PROG_SRC_GLCUBE) fb_vga.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_GLCUBE) fb_vga.c $(LIBM)
 
 # ---- linear vt_fb / scfb / KMS (original) ---------------------------
 ppm2fb.fb: $(PROG_SRC_PPM2FB) fb.c $(HDRS)
@@ -91,13 +102,16 @@ server.fb: $(PROG_SRC_SERVER) fb.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_SERVER) fb.c
 cube.fb: $(PROG_SRC_CUBE) fb.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_CUBE) fb.c $(LIBM)
+glcube.fb: $(PROG_SRC_GLCUBE) fb.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(PROG_SRC_GLCUBE) fb.c $(LIBM)
 
 clean:
 	rm -f ppm2fb.fb ppm2fb.vga ppm2fb.svga ppm2fb.svga3 \
 	      fbshow.fb fbshow.vga fbshow.svga fbshow.svga3 \
 	      server.fb server.vga server.svga server.svga3 \
 	      cube.fb   cube.vga   cube.svga   cube.svga3 \
-	      term \
+	      glcube.fb glcube.vga glcube.svga \
+	      term cubewin \
 	      *.o
 
 .PHONY: all svga svga3 vga fb clean

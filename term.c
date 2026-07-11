@@ -114,6 +114,12 @@ typedef struct {
 	int       saved_cx, saved_cy;
 	int       scroll_top, scroll_bot;  /* DECSTBM margins, 0-based inclusive */
 	int       app_cursor_keys;         /* DECCKM: 1 => arrows report ESC O x */
+	int       insert_mode;             /* IRM (CSI 4h/4l, no '?'): 1 => put_char
+	                                       shifts the row right instead of
+	                                       overwriting -- readline/libedit
+	                                       toggle this per character instead
+	                                       of using ICH (see csi_exec's 'h'/'l'
+	                                       and put_char) */
 
 	/* scrollback: lines pushed off the top of the primary screen (see
 	   region_scroll_up), viewable with the mouse wheel when the foreground
@@ -134,6 +140,18 @@ typedef struct {
 	/* pty */
 	int       pty;            /* master fd */
 	pid_t     child;
+
+	/* pty write queue: t->pty is O_NONBLOCK, and a tty write is not
+	   guaranteed atomic -- writing straight through can hand the kernel
+	   only the first part of an escape sequence when its input queue is
+	   nearly full (a fast mouse-wheel burst translated to many Up/Down
+	   keys is the case that actually hits this -- see handle_mouse_msg),
+	   and the torn remainder desyncs whatever's reading the other end
+	   (vim) for good. pty_write() queues here instead of dropping the
+	   untransmitted tail, so bytes are only ever delayed, never lost or
+	   split. */
+	unsigned char pty_outbuf[4096];
+	size_t        pty_out_len;
 
 	/* keyboard -> pty escape rewriter (see handle_key_byte) */
 	int           kin_state;   /* KIN_* */
@@ -236,6 +254,39 @@ static void region_scroll_down(term_t* t, int top, int bot, int n) {
 		erase_span(t, i * t->cols, (i + 1) * t->cols);
 }
 
+/* Delete n chars at (row,col) within one row: cells shift left, blanks fill
+   in at the row's right edge. This is DCH (CSI P) -- readline/libedit use
+   it to remove a character from a recalled history line in place (e.g.
+   Up-arrow to recall, Left-arrow to the start, Del) instead of redrawing
+   the whole line. Without it the escape was silently dropped (see
+   csi_exec's default case): the grid kept showing the stale character
+   while the shell's own line buffer had already moved on, so the terminal
+   looked like it stopped redrawing, and further typing appeared to
+   "insert" into the leftover text instead of replacing it. */
+static void line_delete_chars(term_t* t, int row, int col, int n) {
+	int base  = row * t->cols;
+	int avail = t->cols - col;
+	if (n <= 0 || avail <= 0) return;
+	if (n > avail) n = avail;
+	if (n < avail)
+		memmove(&t->grid[base + col], &t->grid[base + col + n],
+		        (size_t)(avail - n) * sizeof(cell_t));
+	erase_span(t, base + t->cols - n, base + t->cols);
+}
+
+/* Insert n blank chars at (row,col): cells shift right, overflow past the
+   row's right edge is dropped. This is ICH (CSI @). */
+static void line_insert_chars(term_t* t, int row, int col, int n) {
+	int base  = row * t->cols;
+	int avail = t->cols - col;
+	if (n <= 0 || avail <= 0) return;
+	if (n > avail) n = avail;
+	if (n < avail)
+		memmove(&t->grid[base + col + n], &t->grid[base + col],
+		        (size_t)(avail - n) * sizeof(cell_t));
+	erase_span(t, base + col, base + col + n);
+}
+
 static void newline(term_t* t) {
 	if (t->cy == t->scroll_bot)
 		region_scroll_up(t, t->scroll_top, t->scroll_bot, 1);
@@ -249,6 +300,8 @@ static void put_char(term_t* t, uint32_t cp) {
 		t->cx = 0;
 		newline(t);
 	}
+	if (t->insert_mode)
+		line_insert_chars(t, t->cy, t->cx, 1);
 	c = &t->grid[t->cy * t->cols + t->cx];
 	c->cp = cp;
 	c->fg = t->reverse ? t->cur_bg : t->cur_fg;
@@ -377,6 +430,8 @@ static void csi_exec(term_t* t, unsigned char final) {
 	}
 
 	switch (final) {
+	case '@': line_insert_chars(t, t->cy, t->cx, p0); break;  /* ICH */
+	case 'P': line_delete_chars(t, t->cy, t->cx, p0); break;  /* DCH */
 	case 'A': t->cy -= p0; if (t->cy < 0) t->cy = 0; break;
 	case 'B': t->cy += p0; if (t->cy >= t->rows) t->cy = t->rows - 1; break;
 	case 'C': t->cx += p0; if (t->cx >= t->cols) t->cx = t->cols - 1; break;
@@ -401,8 +456,14 @@ static void csi_exec(term_t* t, unsigned char final) {
 		}
 		break;
 	}
-	case 'h': if (t->priv) dec_mode(t, 1); break;
-	case 'l': if (t->priv) dec_mode(t, 0); break;
+	case 'h':                              /* SM: ANSI mode set */
+		if (t->priv) dec_mode(t, 1);
+		else if (param(t, 0, 0) == 4) t->insert_mode = 1;   /* IRM */
+		break;
+	case 'l':                              /* RM: ANSI mode reset */
+		if (t->priv) dec_mode(t, 0);
+		else if (param(t, 0, 0) == 4) t->insert_mode = 0;   /* IRM */
+		break;
 	case 's': t->saved_cx = t->cx; t->saved_cy = t->cy; break;
 	case 'u': t->cx = t->saved_cx; t->cy = t->saved_cy; break;
 	case 'm': sgr(t); break;
@@ -529,6 +590,7 @@ static void feed(term_t* t, unsigned char ch) {
 			t->grid = t->primary_grid; t->alt_active = 0;
 			grid_clear(t);
 			t->scroll_top = 0; t->scroll_bot = t->rows - 1;
+			t->insert_mode = 0;
 			t->state = S_NORM; break;
 		default: t->state = S_NORM; break;
 		}
@@ -573,12 +635,62 @@ static void feed(term_t* t, unsigned char ch) {
 }
 
 /* ------------------------------------------------------------------ *
+ * pty output: queued, tear-proof writes (see term_t.pty_outbuf).      *
+ * ------------------------------------------------------------------ */
+
+/* Try to drain whatever's already queued. Safe to call any time
+   (idle tick, before a new write, ...); a no-op once the queue is empty. */
+static void pty_flush(term_t* t) {
+	ssize_t w;
+	if (t->pty_out_len == 0)
+		return;
+	w = write(t->pty, t->pty_outbuf, t->pty_out_len);
+	if (w > 0) {
+		memmove(t->pty_outbuf, t->pty_outbuf + w, t->pty_out_len - (size_t)w);
+		t->pty_out_len -= (size_t)w;
+	}
+}
+
+/* Queue n bytes for the pty, writing through immediately when possible.
+ * Never hands the kernel a partial escape sequence and drops the rest --
+ * whatever doesn't fit in one write() is appended to the queue and retried
+ * on the next pty_flush() (every event-loop tick, see main()), so bytes are
+ * only ever delayed, never torn or lost. If the queue itself is full, the
+ * (whole, trailing) excess is dropped -- 4KB comfortably covers any burst
+ * this emulator generates (see handle_mouse_msg), so that only happens if
+ * the far end has stopped reading entirely.
+ */
+static void pty_write(term_t* t, const unsigned char* buf, size_t n) {
+	size_t room;
+	pty_flush(t);
+	if (t->pty_out_len == 0 && n > 0) {
+		ssize_t w = write(t->pty, buf, n);
+		if (w > 0) {
+			buf += w;
+			n   -= (size_t)w;
+		}
+	}
+	room = sizeof(t->pty_outbuf) - t->pty_out_len;
+	if (n > room)
+		n = room;
+	if (n > 0) {
+		memcpy(t->pty_outbuf + t->pty_out_len, buf, n);
+		t->pty_out_len += n;
+	}
+}
+
+/* ------------------------------------------------------------------ *
  * xterm-style mouse reporting -> pty.                                 *
  * ------------------------------------------------------------------ */
 
 /* Encode and send one button/motion report. btn is the xterm button number
-   (0=left,1=middle,2=right,4=wheel-up,5=wheel-down); motion adds the xterm
-   "+32" convention for button-event-tracking drags. col/row are 0-based. */
+   (0=left,1=middle,2=right,64=wheel-up,65=wheel-down -- the wheel buttons
+   need the 0x40 bit set per the xterm mouse-reporting spec: a bare 4/5 has
+   no such bit and gets misread as an ordinary button 0/1 press with the
+   Shift modifier (Cb&4) instead of a wheel event, e.g. as <S-LeftMouse>/
+   <S-MiddleMouse> in vim -- see handle_mouse_msg's callers below); motion
+   adds the xterm "+32" convention for button-event-tracking drags. col/row
+   are 0-based. */
 static void report_button(term_t* t, int btn, int pressed, int motion,
                            int col, int row) {
 	char buf[32];
@@ -592,7 +704,7 @@ static void report_button(term_t* t, int btn, int pressed, int motion,
 		n = snprintf(buf, sizeof(buf), "\033[<%d;%d;%d%c",
 		             cb, cx, cy, pressed ? 'M' : 'm');
 		if (n > 0 && n < (int)sizeof(buf))
-			(void)write(t->pty, buf, (size_t)n);
+			pty_write(t, (unsigned char*)buf, (size_t)n);
 		return;
 	}
 	/* legacy X10 encoding: fixed 6 bytes, release is always reported as
@@ -601,7 +713,7 @@ static void report_button(term_t* t, int btn, int pressed, int motion,
 	buf[3] = (char)(32 + (pressed ? cb : 3));
 	buf[4] = (char)(32 + cx);
 	buf[5] = (char)(32 + cy);
-	(void)write(t->pty, buf, 6);
+	pty_write(t, (unsigned char*)buf, 6);
 }
 
 /* Translate a compositor FBVT_INPUT_MOUSE (pixel coords + button bitmask)
@@ -618,10 +730,36 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 	int i;
 
 	if (t->mouse_mode == 0) {
-		/* the foreground app hasn't grabbed the mouse (e.g. a plain shell
-		   prompt): use the wheel to browse scrollback instead of forwarding
-		   it anywhere. 3 lines/click matches common terminal defaults. */
-		if (dz != 0) {
+		if (t->alt_active) {
+			/* an alt-screen app (vim, less, mc without mouse support...)
+			   owns the display but hasn't asked for mouse reporting -- our
+			   own scrollback is not it (region_scroll_up never pushes into
+			   it while alt_active, see there), so adjusting scroll_offset
+			   here would browse stale primary-screen history underneath a
+			   display it doesn't belong to. Do what real terminals do
+			   (xterm's altSendsXtermScroll, iTerm2, gnome-terminal, ...):
+			   turn the wheel into Up/Down arrow keypresses, which is
+			   exactly what these apps use wheel-less scrolling for. */
+			if (dz != 0) {
+				/* Build the whole repeat-burst in one buffer and hand it to
+				   pty_write() as one call -- see pty_write()'s comment for
+				   why a bare write() here can wedge scrolling for good on a
+				   hard, sustained scroll. */
+				int      lines = dz > 0 ? dz : -dz;
+				int      nrep  = lines * 3;          /* 3 lines/click */
+				unsigned char one[3] = { 0x1B,
+					(unsigned char)(t->app_cursor_keys ? 'O' : '['),
+					(unsigned char)(dz > 0 ? 'A' : 'B') };
+				unsigned char buf[3 * 30];
+				if (nrep > 30) nrep = 30;
+				for (i = 0; i < nrep; i++)
+					memcpy(buf + i * 3, one, 3);
+				pty_write(t, buf, (size_t)nrep * 3);
+			}
+		} else if (dz != 0) {
+			/* plain shell prompt on the primary screen: browse our own
+			   scrollback instead of forwarding the wheel anywhere. 3
+			   lines/click matches common terminal defaults. */
 			t->scroll_offset += dz * 3;
 			if (t->scroll_offset < 0) t->scroll_offset = 0;
 			if (t->scroll_offset > t->sb_count) t->scroll_offset = t->sb_count;
@@ -633,8 +771,8 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 	if (col < 0) col = 0;
 	if (row < 0) row = 0;
 
-	if (dz > 0) report_button(t, 4, 1, 0, col, row);   /* wheel up   */
-	if (dz < 0) report_button(t, 5, 1, 0, col, row);   /* wheel down */
+	if (dz > 0) report_button(t, 64, 1, 0, col, row);  /* wheel up   */
+	if (dz < 0) report_button(t, 65, 1, 0, col, row);  /* wheel down */
 
 	for (i = 0; i < 3; i++) {
 		if (changed & BTN_BIT[i])
@@ -666,7 +804,7 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
  * keys, ordinary text) passes through untouched.                      *
  * ------------------------------------------------------------------ */
 static void flush_raw(term_t* t, const unsigned char* buf, size_t n) {
-	(void)write(t->pty, buf, n);
+	pty_write(t, buf, n);
 }
 
 /* Flush whatever is currently buffered in the keyboard parser as-is (used
@@ -1018,12 +1156,19 @@ int main(int argc, char* argv[]) {
 
 		pfd[0].fd = t.sock; pfd[0].events = POLLIN; pfd[0].revents = 0;
 		pfd[1].fd = t.pty;  pfd[1].events = POLLIN; pfd[1].revents = 0;
+		if (t.pty_out_len > 0)
+			pfd[1].events |= POLLOUT;     /* wake as soon as the pty has room
+			                                  again to drain the rest of a
+			                                  queued burst (see pty_write) */
 
 		n = poll(pfd, 2, 16);
 		if (n < 0 && errno != EINTR)
 			break;
 		if (n == 0)                       /* idle tick: don't leave a real */
 			kin_flush_pending(&t);        /* Escape/truncated CSI hanging  */
+
+		if (pfd[1].revents & POLLOUT)
+			pty_flush(&t);
 
 		/* input keys from the compositor -> the pty */
 		if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
