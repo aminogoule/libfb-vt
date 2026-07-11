@@ -135,6 +135,17 @@ typedef struct {
 	int       pty;            /* master fd */
 	pid_t     child;
 
+	/* pty write queue: t->pty is O_NONBLOCK, and a tty write is not
+	   guaranteed atomic -- writing straight through can hand the kernel
+	   only the first part of an escape sequence when the queue is nearly
+	   full (a fast mouse-wheel burst translated to many Up/Down keys is
+	   the case that actually hits this -- see handle_mouse_msg), and the
+	   torn remainder desyncs whatever's reading the other end (vim) for
+	   good. pty_write() queues here instead of dropping the untransmitted
+	   tail, so bytes are only ever delayed, never lost or split. */
+	unsigned char pty_outbuf[4096];
+	size_t        pty_out_len;
+
 	/* keyboard -> pty escape rewriter (see handle_key_byte) */
 	int           kin_state;   /* KIN_* */
 	unsigned char kin_buf[8];  /* CSI intermediates/params buffered so far */
@@ -573,6 +584,51 @@ static void feed(term_t* t, unsigned char ch) {
 }
 
 /* ------------------------------------------------------------------ *
+ * pty output: queued, tear-proof writes (see term_t.pty_outbuf).      *
+ * ------------------------------------------------------------------ */
+
+/* Try to drain whatever's already queued. Safe to call any time
+   (idle tick, before a new write, ...); a no-op once the queue is empty. */
+static void pty_flush(term_t* t) {
+	ssize_t w;
+	if (t->pty_out_len == 0)
+		return;
+	w = write(t->pty, t->pty_outbuf, t->pty_out_len);
+	if (w > 0) {
+		memmove(t->pty_outbuf, t->pty_outbuf + w, t->pty_out_len - (size_t)w);
+		t->pty_out_len -= (size_t)w;
+	}
+}
+
+/* Queue n bytes for the pty, writing through immediately when possible.
+ * Never hands the kernel a partial escape sequence and drops the rest --
+ * whatever doesn't fit in one write() is appended to the queue and retried
+ * on the next pty_flush() (every event-loop tick, see main()), so bytes are
+ * only ever delayed, never torn or lost. If the queue itself is full, the
+ * (whole, trailing) excess is dropped -- 4KB comfortably covers any burst
+ * this emulator generates (see handle_mouse_msg), so that only happens if
+ * the far end has stopped reading entirely.
+ */
+static void pty_write(term_t* t, const unsigned char* buf, size_t n) {
+	size_t room;
+	pty_flush(t);
+	if (t->pty_out_len == 0 && n > 0) {
+		ssize_t w = write(t->pty, buf, n);
+		if (w > 0) {
+			buf += w;
+			n   -= (size_t)w;
+		}
+	}
+	room = sizeof(t->pty_outbuf) - t->pty_out_len;
+	if (n > room)
+		n = room;
+	if (n > 0) {
+		memcpy(t->pty_outbuf + t->pty_out_len, buf, n);
+		t->pty_out_len += n;
+	}
+}
+
+/* ------------------------------------------------------------------ *
  * xterm-style mouse reporting -> pty.                                 *
  * ------------------------------------------------------------------ */
 
@@ -592,7 +648,7 @@ static void report_button(term_t* t, int btn, int pressed, int motion,
 		n = snprintf(buf, sizeof(buf), "\033[<%d;%d;%d%c",
 		             cb, cx, cy, pressed ? 'M' : 'm');
 		if (n > 0 && n < (int)sizeof(buf))
-			(void)write(t->pty, buf, (size_t)n);
+			pty_write(t, (unsigned char*)buf, (size_t)n);
 		return;
 	}
 	/* legacy X10 encoding: fixed 6 bytes, release is always reported as
@@ -601,7 +657,7 @@ static void report_button(term_t* t, int btn, int pressed, int motion,
 	buf[3] = (char)(32 + (pressed ? cb : 3));
 	buf[4] = (char)(32 + cx);
 	buf[5] = (char)(32 + cy);
-	(void)write(t->pty, buf, 6);
+	pty_write(t, (unsigned char*)buf, 6);
 }
 
 /* Translate a compositor FBVT_INPUT_MOUSE (pixel coords + button bitmask)
@@ -629,17 +685,13 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 			   turn the wheel into Up/Down arrow keypresses, which is
 			   exactly what these apps use wheel-less scrolling for. */
 			if (dz != 0) {
-				/* Build the whole repeat-burst in one buffer and send it as
-				   a single write(). t->pty is O_NONBLOCK (see fcntl() near
-				   the pty setup below); a tty write is not guaranteed
-				   atomic, so N separate 3-byte write() calls risk one of
-				   them landing partially -- a torn ESC/'['/final byte then
-				   corrupts the framing of every escape sequence sent after
-				   it, which is exactly what made scrolling wedge for good
-				   once the wheel was spun hard (e.g. flicking all the way
-				   to the top of the buffer). One write() of a small, capped
-				   burst keeps this comfortably inside the pty's input queue
-				   so it can't be torn in practice. */
+				/* Build the whole repeat-burst in one buffer and hand it to
+				   pty_write() as one call. A hard, sustained scroll can
+				   generate these faster than vim drains its pty input queue;
+				   pty_write() queues whatever the kernel won't take right
+				   now instead of tearing an escape sequence in half and
+				   losing the rest -- see pty_write()'s comment for why a
+				   plain write() here used to wedge scrolling for good. */
 				int      lines = dz > 0 ? dz : -dz;
 				int      nrep  = lines * 3;          /* 3 lines/click */
 				unsigned char one[3] = { 0x1B,
@@ -649,7 +701,7 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
 				if (nrep > 30) nrep = 30;
 				for (i = 0; i < nrep; i++)
 					memcpy(buf + i * 3, one, 3);
-				(void)write(t->pty, buf, (size_t)nrep * 3);
+				pty_write(t, buf, (size_t)nrep * 3);
 			}
 		} else if (dz != 0) {
 			/* plain shell prompt on the primary screen: browse our own
@@ -699,7 +751,7 @@ static void handle_mouse_msg(term_t* t, const struct fbvt_msg* m) {
  * keys, ordinary text) passes through untouched.                      *
  * ------------------------------------------------------------------ */
 static void flush_raw(term_t* t, const unsigned char* buf, size_t n) {
-	(void)write(t->pty, buf, n);
+	pty_write(t, buf, n);
 }
 
 /* Flush whatever is currently buffered in the keyboard parser as-is (used
@@ -1051,12 +1103,19 @@ int main(int argc, char* argv[]) {
 
 		pfd[0].fd = t.sock; pfd[0].events = POLLIN; pfd[0].revents = 0;
 		pfd[1].fd = t.pty;  pfd[1].events = POLLIN; pfd[1].revents = 0;
+		if (t.pty_out_len > 0)
+			pfd[1].events |= POLLOUT;     /* wake as soon as the pty has room
+			                                  again to drain the rest of a
+			                                  queued burst (see pty_write) */
 
 		n = poll(pfd, 2, 16);
 		if (n < 0 && errno != EINTR)
 			break;
 		if (n == 0)                       /* idle tick: don't leave a real */
 			kin_flush_pending(&t);        /* Escape/truncated CSI hanging  */
+
+		if (pfd[1].revents & POLLOUT)
+			pty_flush(&t);
 
 		/* input keys from the compositor -> the pty */
 		if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
