@@ -248,6 +248,39 @@ static void region_scroll_down(term_t* t, int top, int bot, int n) {
 		erase_span(t, i * t->cols, (i + 1) * t->cols);
 }
 
+/* Delete n chars at (row,col) within one row: cells shift left, blanks fill
+   in at the row's right edge. This is DCH (CSI P) -- readline/libedit use
+   it to remove a character from a recalled history line in place (e.g.
+   Up-arrow to recall, Left-arrow to the start, Del) instead of redrawing
+   the whole line. Without it the escape was silently dropped (see
+   csi_exec's default case): the grid kept showing the stale character
+   while the shell's own line buffer had already moved on, so the terminal
+   looked like it stopped redrawing, and further typing appeared to
+   "insert" into the leftover text instead of replacing it. */
+static void line_delete_chars(term_t* t, int row, int col, int n) {
+	int base  = row * t->cols;
+	int avail = t->cols - col;
+	if (n <= 0 || avail <= 0) return;
+	if (n > avail) n = avail;
+	if (n < avail)
+		memmove(&t->grid[base + col], &t->grid[base + col + n],
+		        (size_t)(avail - n) * sizeof(cell_t));
+	erase_span(t, base + t->cols - n, base + t->cols);
+}
+
+/* Insert n blank chars at (row,col): cells shift right, overflow past the
+   row's right edge is dropped. This is ICH (CSI @). */
+static void line_insert_chars(term_t* t, int row, int col, int n) {
+	int base  = row * t->cols;
+	int avail = t->cols - col;
+	if (n <= 0 || avail <= 0) return;
+	if (n > avail) n = avail;
+	if (n < avail)
+		memmove(&t->grid[base + col + n], &t->grid[base + col],
+		        (size_t)(avail - n) * sizeof(cell_t));
+	erase_span(t, base + col, base + col + n);
+}
+
 static void newline(term_t* t) {
 	if (t->cy == t->scroll_bot)
 		region_scroll_up(t, t->scroll_top, t->scroll_bot, 1);
@@ -389,6 +422,8 @@ static void csi_exec(term_t* t, unsigned char final) {
 	}
 
 	switch (final) {
+	case '@': line_insert_chars(t, t->cy, t->cx, p0); break;  /* ICH */
+	case 'P': line_delete_chars(t, t->cy, t->cx, p0); break;  /* DCH */
 	case 'A': t->cy -= p0; if (t->cy < 0) t->cy = 0; break;
 	case 'B': t->cy += p0; if (t->cy >= t->rows) t->cy = t->rows - 1; break;
 	case 'C': t->cx += p0; if (t->cx >= t->cols) t->cx = t->cols - 1; break;
